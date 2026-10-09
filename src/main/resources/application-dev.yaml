@@ -1,0 +1,11 @@
+# Development profile: enables ledger seeding and runtime log-level changes.
+# Never activate this profile in a shared or production environment.
+payout:
+  ledger:
+    seed-enabled: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info, metrics, loggers

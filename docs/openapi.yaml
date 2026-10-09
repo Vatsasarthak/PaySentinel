@@ -1,0 +1,327 @@
+openapi: 3.0.3
+info:
+  title: Outbox Payment System API
+  version: 1.0.0
+  description: |
+    Simulated payout processing built on the transactional outbox pattern. No real money moves.
+
+    Authenticate every request (except `/actuator/health` and `/actuator/info`) with an API key
+    in the `X-API-Key` header. A CLIENT key may create and read payouts only for the ledger accounts
+    it is granted. The ADMIN key may use the ledger, reconciliation and dead-letter endpoints and the
+    non-public actuator endpoints; it may create or read payouts only for accounts explicitly granted
+    to it (or read all payouts when `payout.security.admin.read-all-payouts=true`).
+
+    Requests are rate limited per API key (and invalid keys per client IP); limited requests get 429
+    with a `Retry-After` header.
+
+    Errors are returned as RFC 7807 problem details (`application/problem+json`).
+servers:
+  - url: http://localhost:8080
+security:
+  - ApiKey: []
+paths:
+  /api/v1/payouts:
+    post:
+      summary: Initiate a payout
+      description: |
+        Holds the amount in the recipient's ledger account and records the payout and its outbox event.
+        Processing continues asynchronously; poll `GET /api/v1/payouts/{id}` for the outcome.
+
+        The payout row, the ledger hold and the outbox event are committed in one transaction.
+
+        Idempotency keys are scoped to the API client: repeating a request with the same
+        `idempotencyKey` and identical fields returns the original payout (202); reusing the key with
+        different fields returns 409 (`idempotency-key-reused`).
+      operationId: initiatePayout
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PayoutRequest' }
+            example:
+              recipientId: user_123
+              amount: 5000
+              currency: INR
+              idempotencyKey: payout-req-001
+      responses:
+        '202':
+          description: Payout accepted (or idempotent replay of an existing payout)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PayoutResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: The API key is not granted the `recipientId` account (`account-access-denied`)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422':
+          description: Insufficient balance or unknown recipient account
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /api/v1/payouts/{id}:
+    get:
+      summary: Get a payout
+      description: Returns 404 both for unknown payouts and for payouts on accounts the API key is not granted.
+      operationId: getPayoutById
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: The payout
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PayoutResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /api/v1/payouts/ledger/seed:
+    post:
+      summary: Set a ledger balance (development only, ADMIN)
+      description: Only exists when `payout.ledger.seed-enabled=true` (the `dev` profile). Overwrites the balance.
+      operationId: seedBalance
+      parameters:
+        - name: accountId
+          in: query
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{1,64}$' }
+        - name: amount
+          in: query
+          required: true
+          schema: { type: integer, format: int64, minimum: 0, maximum: 1000000000000 }
+      responses:
+        '200':
+          description: Balance seeded
+          content:
+            text/plain:
+              schema: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/payouts/ledger/balance/{accountId}:
+    get:
+      summary: Read a ledger balance (ADMIN)
+      operationId: getBalance
+      parameters:
+        - name: accountId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{1,64}$' }
+      responses:
+        '200':
+          description: Current balance
+          content:
+            application/json:
+              schema: { type: integer, format: int64 }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/payouts/ledger/accounts/{accountId}:
+    get:
+      summary: Read a ledger account with its latest entries (ADMIN)
+      operationId: getAccount
+      parameters:
+        - name: accountId
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{1,64}$' }
+      responses:
+        '200':
+          description: Balances and the 50 most recent ledger entries
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LedgerAccount' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/payouts/ledger/reconciliation:
+    get:
+      summary: Verify ledger consistency (ADMIN)
+      operationId: reconcile
+      responses:
+        '200':
+          description: Reconciliation report
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReconciliationReport' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /api/v1/payouts/dlq:
+    get:
+      summary: List dead-lettered queue messages (ADMIN)
+      operationId: getDlqEntries
+      responses:
+        '200':
+          description: Raw queue payloads, oldest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /actuator/health:
+    get:
+      summary: Health check (public; component details for ADMIN only)
+      security: []
+      responses:
+        '200': { description: Application is up }
+        '503': { description: Application or a dependency is down }
+components:
+  securitySchemes:
+    ApiKey:
+      type: apiKey
+      in: header
+      name: X-API-Key
+  schemas:
+    PayoutRequest:
+      type: object
+      required: [recipientId, amount, currency, idempotencyKey]
+      properties:
+        recipientId:
+          type: string
+          pattern: '^[A-Za-z0-9_-]{1,64}$'
+          description: Ledger account the payout is funded from.
+        amount:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 1000000000000
+          description: Integer amount in the account's currency units.
+        currency:
+          type: string
+          pattern: '^[A-Z]{3}$'
+          description: ISO 4217 code; must be one of `payout.supported-currencies` (default INR).
+        idempotencyKey:
+          type: string
+          pattern: '^[A-Za-z0-9._:-]{8,128}$'
+    PayoutResponse:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        recipientId: { type: string }
+        amount: { type: integer, format: int64 }
+        currency: { type: string }
+        status:
+          type: string
+          enum: [PENDING, PROCESSING, COMPLETED, FAILED, REJECTED, CANCELLED, RESERVING]
+          description: CANCELLED and RESERVING only appear on payouts created before migration V4.
+        fundsStatus:
+          type: string
+          enum: [NONE, HELD, SETTLED, RELEASED, RELEASE_PENDING, SETTLE_PENDING, LEGACY_HELD]
+          description: State of the ledger hold. RELEASED means the amount was returned to the account.
+        failureReason:
+          type: string
+          nullable: true
+          description: DECLINED, RETRIES_EXHAUSTED or MAX_DELIVERY_ATTEMPTS; legacy rows may carry other values.
+        providerReference:
+          type: string
+          nullable: true
+          description: Payment reference from the provider, set when the payout completed.
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        attempts: { type: integer }
+      example:
+        id: f2f6a4d7-8d7a-4d62-8d1f-3b2b7b0a1a7c
+        recipientId: user_123
+        amount: 5000
+        currency: INR
+        status: PENDING
+        fundsStatus: HELD
+        failureReason: null
+        providerReference: null
+        createdAt: '2026-07-04T04:30:00.123456Z'
+        updatedAt: '2026-07-04T04:30:00.131002Z'
+        attempts: 0
+    LedgerAccount:
+      type: object
+      properties:
+        accountId: { type: string }
+        availableBalance: { type: integer, format: int64 }
+        heldBalance: { type: integer, format: int64 }
+        recentEntries:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: integer, format: int64 }
+              accountId: { type: string }
+              payoutId: { type: string, format: uuid, nullable: true }
+              entryType: { type: string, enum: [OPENING_BALANCE, ADJUSTMENT, HOLD, RELEASE, SETTLE] }
+              availableDelta: { type: integer, format: int64 }
+              heldDelta: { type: integer, format: int64 }
+              availableAfter: { type: integer, format: int64 }
+              heldAfter: { type: integer, format: int64 }
+              idempotencyKey: { type: string }
+              createdAt: { type: string, format: date-time }
+    ReconciliationReport:
+      type: object
+      properties:
+        consistent: { type: boolean }
+        mismatchCount: { type: integer }
+        accountsWithBalanceDrift: { type: array, items: { type: string } }
+        accountsWithHeldDrift: { type: array, items: { type: string } }
+        payoutsWithLedgerMismatch: { type: array, items: { type: string } }
+    Problem:
+      type: object
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        errors:
+          type: object
+          additionalProperties: { type: string }
+          description: Field-level messages (validation failures only).
+  responses:
+    BadRequest:
+      description: Invalid input (validation failure, malformed JSON, malformed UUID or parameter)
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example:
+            type: https://outbox-payments.com/errors/validation-failed
+            title: Validation Failed
+            status: 400
+            detail: One or more fields are invalid
+            instance: /api/v1/payouts
+            errors: { amount: Amount must be greater than 0 }
+    Unauthorized:
+      description: Missing or invalid API key
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Forbidden:
+      description: The API key's role does not allow this operation
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    NotFound:
+      description: Resource or route not found
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    TooManyRequests:
+      description: Rate limit exceeded; retry after the number of seconds in `Retry-After`
+      headers:
+        Retry-After:
+          schema: { type: integer }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Conflict:
+      description: Idempotency key reused with a different request
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }

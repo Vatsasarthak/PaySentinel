@@ -1,0 +1,16 @@
+package com.pay.outbox.domain.enums;
+
+public enum PayoutStatus {
+    /** Row created; the ledger hold is in progress. */
+    RESERVING,
+    /** Funds held and outbox event written; waiting for a worker. */
+    PENDING,
+    /** Claimed by a worker holding a lease. */
+    PROCESSING,
+    COMPLETED,
+    FAILED,
+    /** Reservation abandoned before the payout was accepted; any hold is released. */
+    CANCELLED,
+    /** Insufficient balance or unknown account; nothing was held. */
+    REJECTED
+}

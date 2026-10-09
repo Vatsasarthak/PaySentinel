@@ -1,0 +1,128 @@
+spring:
+  application:
+    name: outbox
+
+  # Local development convenience: values from ./.env (KEY=value lines) become resolvable
+  # placeholders. The file is optional and must never be committed.
+  config:
+    import: optional:file:.env[.properties]
+
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/payment_db}
+    username: ${DB_USERNAME:${POSTGRES_USER:payment_user}}
+    password: ${DB_PASSWORD:${POSTGRES_PASSWORD}}
+    hikari:
+      maximum-pool-size: ${DB_POOL_SIZE:20}
+
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: true
+
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      timeout: 2000ms
+
+server:
+  shutdown: graceful
+  error:
+    include-stacktrace: never
+    include-message: never
+    include-binding-errors: never
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info, metrics
+  endpoint:
+    health:
+      show-details: when-authorized
+      roles: ADMIN
+  info:
+    env:
+      enabled: true
+
+info:
+  app:
+    name: ${spring.application.name}
+    description: Payment Outbox System
+    version: 1.0.0
+
+payout:
+  supported-currencies: INR
+  scheduling:
+    enabled: true
+    pool-size: 4
+  relay:
+    interval-ms: 1000
+    batch-size: 100
+    lock-at-most-for: PT1M
+  worker:
+    poll-interval-ms: 200
+    batch-size: 20
+    concurrency: 16
+    lease-duration: PT60S
+    max-delivery-attempts: 5
+  queue:
+    visibility-timeout: PT2M
+    recovery-scan-limit: 500
+  recovery:
+    interval-ms: 30000
+    initial-delay-ms: 10000
+    lock-at-most-for: PT5M
+    reconciliation-interval-ms: 300000
+    stuck-payout-timeout: PT10M
+    batch-size: 100
+  gateway:
+    success-percent: 70
+    failure-percent: 20
+    processed-before-timeout-percent: 50
+    max-attempts: 3
+    backoff-delay-ms: 2000
+    backoff-multiplier: 2
+  ledger:
+    seed-enabled: false
+    redis-import-enabled: ${LEDGER_REDIS_IMPORT_ENABLED:true}
+  security:
+    # One client is configurable through environment variables. For several clients, provide the
+    # whole payout.security.clients list in an extra config file (SPRING_CONFIG_ADDITIONAL_LOCATION);
+    # lists are replaced, not merged, across configuration sources.
+    clients:
+      - name: ${APP_CLIENT_NAME:default-client}
+        api-key: ${APP_CLIENT_API_KEY:}
+        api-key-sha256: ${APP_CLIENT_API_KEY_SHA256:}
+        accounts: ${APP_CLIENT_ACCOUNTS:}
+    admin:
+      api-key: ${APP_ADMIN_API_KEY:}
+      api-key-sha256: ${APP_ADMIN_API_KEY_SHA256:}
+      accounts: ${APP_ADMIN_ACCOUNTS:}
+      read-all-payouts: ${APP_ADMIN_READ_ALL_PAYOUTS:false}
+  rate-limit:
+    enabled: true
+    fail-open: true
+    create:
+      capacity: 50
+      refill-per-second: 20
+    read:
+      capacity: 200
+      refill-per-second: 100
+    admin:
+      capacity: 30
+      refill-per-second: 10
+    auth-failure:
+      capacity: 20
+      refill-per-second: 1

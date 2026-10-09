@@ -1,0 +1,88 @@
+# Local development stack. Credentials come from .env (see .env.example).
+#   docker compose up -d                      # PostgreSQL + Redis only
+#   docker compose --profile app up -d --build  # also build and run the application
+services:
+  postgres:
+    image: postgres:16
+    container_name: payment_postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-payment_db}
+      POSTGRES_USER: ${POSTGRES_USER:-payment_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: payment_redis
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}
+    # appendfsync always: ledger writes are fsynced before acknowledgement (durability over throughput).
+    # noeviction: Redis must never silently drop balances, hold markers or queued messages.
+    # Destructive or expensive admin commands are disabled; the application uses none of them.
+    command: >
+      sh -c 'exec redis-server --appendonly yes --appendfsync always
+      --maxmemory-policy noeviction --requirepass "$$REDIS_PASSWORD"
+      --rename-command FLUSHALL "" --rename-command FLUSHDB "" --rename-command DEBUG ""
+      --rename-command KEYS ""'
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "127.0.0.1:${REDIS_HOST_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  app:
+    profiles: ["app"]
+    build: .
+    image: outbox-payment-system:local
+    container_name: payment_app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-payment_db}
+      DB_USERNAME: ${POSTGRES_USER:-payment_user}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      APP_CLIENT_NAME: ${APP_CLIENT_NAME:-default-client}
+      APP_CLIENT_API_KEY: ${APP_CLIENT_API_KEY:-}
+      APP_CLIENT_API_KEY_SHA256: ${APP_CLIENT_API_KEY_SHA256:-}
+      APP_CLIENT_ACCOUNTS: ${APP_CLIENT_ACCOUNTS:?Set APP_CLIENT_ACCOUNTS in .env}
+      APP_ADMIN_API_KEY: ${APP_ADMIN_API_KEY:-}
+      APP_ADMIN_API_KEY_SHA256: ${APP_ADMIN_API_KEY_SHA256:-}
+      APP_ADMIN_READ_ALL_PAYOUTS: ${APP_ADMIN_READ_ALL_PAYOUTS:-false}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-20}
+      SPRING_PROFILES_ACTIVE: ${SPRING_PROFILES_ACTIVE:-}
+    ports:
+      - "127.0.0.1:${APP_HOST_PORT:-8080}:8080"
+    # The application writes nothing to disk; only /tmp (Tomcat work files) needs to be writable.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  postgres_data:
+  redis_data:

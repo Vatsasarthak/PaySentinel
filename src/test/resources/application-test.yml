@@ -1,0 +1,45 @@
+# Datasource and Redis connection settings are supplied by BaseIntegrationTest from Testcontainers.
+spring:
+  jpa:
+    hibernate:
+      ddl-auto: validate
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+payout:
+  scheduling:
+    # Tests drive the relay, worker and recovery jobs explicitly to keep assertions deterministic.
+    enabled: false
+  ledger:
+    seed-enabled: true
+  gateway:
+    max-attempts: 3
+    backoff-delay-ms: 10
+    backoff-multiplier: 1
+  worker:
+    batch-size: 10
+    concurrency: 4
+  security:
+    # Test-only keys; never used outside the test profile.
+    clients:
+      - name: test-client
+        api-key: test-client-api-key-0123456789abcdef
+        accounts: [test_user, shared_account]
+      - name: other-client
+        api-key: other-client-api-key-0123456789abcdef
+        accounts: [other_user, shared_account]
+    admin:
+      api-key: test-admin-api-key-0123456789abcdef
+      accounts: []
+      read-all-payouts: false
+  rate-limit:
+    # Generous defaults so ordinary tests are never throttled; RateLimitIntegrationTest tightens them.
+    create: { capacity: 10000, refill-per-second: 10000 }
+    read: { capacity: 10000, refill-per-second: 10000 }
+    admin: { capacity: 10000, refill-per-second: 10000 }
+    auth-failure: { capacity: 10000, refill-per-second: 10000 }
+
+logging:
+  level:
+    com.pay.outbox: INFO
