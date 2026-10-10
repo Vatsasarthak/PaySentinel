@@ -38,6 +38,7 @@ Java 21 · Spring Boot 3.5 · PostgreSQL 16 · Redis 7 · Flyway · Docker
 - [Known limitations](#known-limitations)
 - [Roadmap](#roadmap)
 
+A component diagram of the running system is in [`docs/architecture.md`](docs/architecture.md).
 Interview notes, a resume entry and the locally verified demo results are in
 [`docs/PORTFOLIO.md`](docs/PORTFOLIO.md).
 
@@ -68,6 +69,9 @@ flowchart LR
 | `security/` | API-key authentication, principals and account grants, Redis rate limiter |
 | `scheduler/`, `worker/` | Outbox relay, recovery and reconciliation jobs, queue consumer |
 | `config/`, `domain/`, `dto/`, `repository/`, `exception/`, `metrics/` | Configuration, model, persistence, errors, metrics |
+
+The full component diagram (security filter chain, controllers, services, background jobs, and what is
+stored in PostgreSQL and Redis) and the startup order are in [`docs/architecture.md`](docs/architecture.md).
 
 ## Payout lifecycle
 
@@ -238,11 +242,12 @@ Variables exported in your shell take precedence over `.env` when docker compose
 
 ### 4. Try it
 
-A fresh database has **no ledger accounts**: `GET /api/v1/payouts/ledger/balance/user_123` returns
-404 with `type` ending in `account-not-found` (a missing *route* returns `about:blank` / "No static
+A fresh database has **no ledger accounts**: `GET /api/v1/payouts/ledger/balance/user_123` with the
+**ADMIN** key returns 404 with `type` ending in `account-not-found` (a missing *route* returns `about:blank` / "No static
 resource" instead). In local development the account is created by the seeding endpoint, which **sets**
 (overwrites) the available balance and records a ledger entry and an audit event. Elsewhere, accounts are
-funded through dual-approved treasury adjustments.
+funded through dual-approved treasury adjustments. Every `/api/v1/payouts/ledger/**` endpoint is
+ADMIN-only: called with the CLIENT key it returns `403 Forbidden`, which is expected (see [API](#api)).
 
 Amounts are whole **paise** (see [Amounts](#amounts)): the examples below seed 100000 = ₹1,000.00 and
 pay out 5000 = ₹50.00.
@@ -350,6 +355,7 @@ Flyway runs automatically at startup (`src/main/resources/db/migration`):
 | Redis `NOAUTH` / "invalid password" | The Redis container was started with a different `REDIS_PASSWORD`. Restore the original value, or recreate only the Redis container (`docker compose up -d --force-recreate redis`; the volume and data are kept). |
 | Flyway: "Validate failed: Migration checksum mismatch" | An already-applied migration file under `db/migration` was edited. Restore its original content and add a new `V6__...` migration instead; never edit applied migrations or delete rows from `flyway_schema_history`. |
 | `401 Unauthorized` | Missing or wrong `X-API-Key`. Keys are read when the app starts: restart a host-run app, or recreate the app container (step 7) after changing `.env`. |
+| `403 Forbidden` (`type` ending `forbidden`) on `/api/v1/payouts/ledger/**` or `/api/v1/payouts/dlq` | Expected with a CLIENT key: these endpoints are ADMIN-only. Use the ADMIN key. In Windows PowerShell the response body is in `$_.ErrorDetails.Message` (see [API examples](#examples-powershell)). |
 | `403 account-access-denied` | The key is not granted that account (`APP_CLIENT_ACCOUNTS`). The admin key cannot create payouts unless `APP_ADMIN_ACCOUNTS` grants it. |
 | `404` on the ledger balance with `type` ending `account-not-found` | The route exists but the account does not: seed it (dev) or fund it via treasury. |
 | `404 "No static resource ...ledger/seed"` | The seeding route is not registered: the `dev` profile is not active (step 3). |
@@ -460,10 +466,16 @@ Application settings (`application.yaml`, prefix `payout.`):
 All endpoints except `/actuator/health` and `/actuator/info` require an `X-API-Key` header. The full
 specification is in [`docs/openapi.yaml`](docs/openapi.yaml).
 
+> **ADMIN-only endpoints.** Every `/api/v1/payouts/ledger/**` endpoint (balance, account, reconciliation,
+> audit, seeding) and `/api/v1/payouts/dlq` require the ADMIN key. A CLIENT key receives
+> `403 Forbidden` with a problem-details body whose `type` ends in `forbidden`. This is expected
+> behaviour, not a key problem (an unknown key gets `401`). Clients read their payouts with
+> `GET /api/v1/payouts/{id}`; balances and reconciliation are operator views.
+
 | Method | Path | Who | Description |
 | --- | --- | --- | --- |
-| `POST` | `/api/v1/payouts` | Key granted the `recipientId` account | Initiate a payout. `202 Accepted` |
-| `GET` | `/api/v1/payouts/{id}` | Key granted the payout's account (ADMIN: accounts in `APP_ADMIN_ACCOUNTS`, or all with read-all) | Fetch a payout |
+| `POST` | `/api/v1/payouts` | CLIENT (or ADMIN) key granted the `recipientId` account | Initiate a payout. `202 Accepted` |
+| `GET` | `/api/v1/payouts/{id}` | CLIENT or ADMIN key granted the payout's account (ADMIN: accounts in `APP_ADMIN_ACCOUNTS`, or all with read-all) | Fetch a payout |
 | `POST` | `/api/v1/payouts/ledger/seed?accountId=&amount=` | ADMIN, `dev` only | Set an account's available balance |
 | `GET` | `/api/v1/payouts/ledger/balance/{accountId}` | ADMIN | Available balance |
 | `GET` | `/api/v1/payouts/ledger/accounts/{accountId}` | ADMIN | Available and held balance, last 50 ledger entries |
@@ -477,6 +489,66 @@ specification is in [`docs/openapi.yaml`](docs/openapi.yaml).
 | `POST` | `/api/v1/treasury/payout-reviews/{id}/resolution` | TREASURY | `{"resolution":"COMPLETED","providerReference":"...","note":"..."}` or `FAILED` |
 | `GET` | `/actuator/health`, `/actuator/info` | public | Health (component details for ADMIN); configured app name, description and version |
 | `GET` | `/actuator/metrics/**` | ADMIN | Metrics |
+
+### Examples (PowerShell)
+
+These examples work in Windows PowerShell 5.1 and PowerShell 7. They read the two keys from `.env` into
+environment variables of the current PowerShell session, so no key is typed, hard-coded or printed.
+
+```powershell
+# Run from the project directory. The variables last only for this PowerShell session.
+Get-Content .env | Where-Object { $_ -match '^\s*(APP_CLIENT_API_KEY|APP_ADMIN_API_KEY)\s*=' } |
+    ForEach-Object { $name, $value = $_ -split '=', 2; Set-Item -Path "Env:$($name.Trim())" -Value $value.Trim() }
+$base = 'http://localhost:8080'
+```
+
+**1. Create a payout (CLIENT key).** `recipientId` must be an account granted to the CLIENT key
+(`APP_CLIENT_ACCOUNTS`) and must have enough available balance. This holds 5000 paise (₹50.00) in your
+local ledger and sends the payment to the simulator.
+
+```powershell
+$request = @{
+    recipientId    = 'user_123'          # account granted to the CLIENT key
+    amount         = 5000                # whole paise: 5000 = INR 50.00
+    currency       = 'INR'
+    idempotencyKey = 'demo-payout-0001'  # resend the same request to retry safely; use a new key for a new payout
+} | ConvertTo-Json
+$payout = Invoke-RestMethod -Method Post "$base/api/v1/payouts" -ContentType 'application/json' `
+    -Headers @{ 'X-API-Key' = $env:APP_CLIENT_API_KEY } -Body $request
+$payout | Select-Object id, status, fundsStatus   # 202 Accepted: PENDING / HELD
+```
+
+Re-sending the same request with the same key returns the same payout. The same key with a different
+payload returns `409 Conflict` (`idempotency-key-reused`).
+
+**2. Retrieve the payout by its ID (CLIENT key).** Processing is asynchronous; repeat until `status` is
+`COMPLETED`, `FAILED` or `MANUAL_REVIEW`.
+
+```powershell
+Invoke-RestMethod "$base/api/v1/payouts/$($payout.id)" -Headers @{ 'X-API-Key' = $env:APP_CLIENT_API_KEY } |
+    Select-Object id, status, fundsStatus, attempts, failureReason
+```
+
+A payout on an account the key is not granted returns `404`, so its existence is not revealed.
+
+**3. Run ledger reconciliation (ADMIN key).** Read-only: it checks balances against the journal and
+changes nothing.
+
+```powershell
+Invoke-RestMethod "$base/api/v1/payouts/ledger/reconciliation" -Headers @{ 'X-API-Key' = $env:APP_ADMIN_API_KEY }
+# consistent = True and mismatchCount = 0 when the ledger agrees with its journal
+```
+
+The same call with the CLIENT key returns `403 Forbidden`, as expected for an ADMIN-only endpoint.
+PowerShell reports the error instead of printing the body; read the body like this:
+
+```powershell
+try { Invoke-RestMethod "$base/api/v1/payouts/ledger/reconciliation" -Headers @{ 'X-API-Key' = $env:APP_CLIENT_API_KEY } }
+catch { $_.ErrorDetails.Message }   # {"type":"...forbidden","title":"Forbidden","status":403,...}
+```
+
+When you are done, remove the keys from the session:
+`Remove-Item Env:APP_CLIENT_API_KEY, Env:APP_ADMIN_API_KEY`.
 
 ### Amounts
 
