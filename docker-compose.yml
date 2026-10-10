@@ -1,9 +1,12 @@
+
 # Local development stack. Credentials come from .env (see .env.example).
-#   docker compose up -d                      # PostgreSQL + Redis only
-#   docker compose --profile app up -d --build  # also build and run the application
+#   docker compose up -d
+#   docker compose --profile app up -d --build
+
 services:
   postgres:
-    image: postgres:16
+    # Pinned by digest (registry index digest for postgres:16, verified 2026-10-10); Dependabot updates it.
+    image: postgres:16@sha256:ca0bd484cb98bf4b24eb1010e73fb3fcbd6714d240fbc1a10eea5b7dbecb641d
     container_name: payment_postgres
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-payment_db}
@@ -22,16 +25,15 @@ services:
       retries: 20
 
   redis:
-    image: redis:7-alpine
+    # Pinned by digest (registry index digest for redis:7-alpine, verified 2026-10-10); Dependabot updates it.
+    image: redis:7-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
     container_name: payment_redis
     environment:
       REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}
-    # appendfsync always: ledger writes are fsynced before acknowledgement (durability over throughput).
-    # noeviction: Redis must never silently drop balances, hold markers or queued messages.
-    # Destructive or expensive admin commands are disabled; the application uses none of them.
     command: >
-      sh -c 'exec redis-server --appendonly yes --appendfsync always
-      --maxmemory-policy noeviction --requirepass "$$REDIS_PASSWORD"
+      sh -c 'umask 077 && printf "requirepass %s\n" "$$REDIS_PASSWORD" > /tmp/redis-auth.conf
+      && exec redis-server /tmp/redis-auth.conf --appendonly yes --appendfsync always
+      --maxmemory-policy noeviction
       --rename-command FLUSHALL "" --rename-command FLUSHDB "" --rename-command DEBUG ""
       --rename-command KEYS ""'
     security_opt:
@@ -41,7 +43,7 @@ services:
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$REDIS_PASSWORD\" redis-cli ping | grep -q PONG"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -49,7 +51,7 @@ services:
   app:
     profiles: ["app"]
     build: .
-    image: outbox-payment-system:local
+    image: paysentinel:local
     container_name: payment_app
     depends_on:
       postgres:
@@ -63,18 +65,37 @@ services:
       REDIS_HOST: redis
       REDIS_PORT: 6379
       REDIS_PASSWORD: ${REDIS_PASSWORD}
+
       APP_CLIENT_NAME: ${APP_CLIENT_NAME:-default-client}
       APP_CLIENT_API_KEY: ${APP_CLIENT_API_KEY:-}
       APP_CLIENT_API_KEY_SHA256: ${APP_CLIENT_API_KEY_SHA256:-}
       APP_CLIENT_ACCOUNTS: ${APP_CLIENT_ACCOUNTS:?Set APP_CLIENT_ACCOUNTS in .env}
+
       APP_ADMIN_API_KEY: ${APP_ADMIN_API_KEY:-}
       APP_ADMIN_API_KEY_SHA256: ${APP_ADMIN_API_KEY_SHA256:-}
+      APP_ADMIN_ACCOUNTS: ${APP_ADMIN_ACCOUNTS:-}
       APP_ADMIN_READ_ALL_PAYOUTS: ${APP_ADMIN_READ_ALL_PAYOUTS:-false}
+
+      APP_TREASURY_1_NAME: ${APP_TREASURY_1_NAME:-treasury-1}
+      APP_TREASURY_1_API_KEY: ${APP_TREASURY_1_API_KEY:-}
+      APP_TREASURY_1_API_KEY_SHA256: ${APP_TREASURY_1_API_KEY_SHA256:-}
+      APP_TREASURY_1_ACCOUNTS: ${APP_TREASURY_1_ACCOUNTS:-}
+      APP_TREASURY_1_ALL_ACCOUNTS: ${APP_TREASURY_1_ALL_ACCOUNTS:-false}
+
+      APP_TREASURY_2_NAME: ${APP_TREASURY_2_NAME:-treasury-2}
+      APP_TREASURY_2_API_KEY: ${APP_TREASURY_2_API_KEY:-}
+      APP_TREASURY_2_API_KEY_SHA256: ${APP_TREASURY_2_API_KEY_SHA256:-}
+      APP_TREASURY_2_ACCOUNTS: ${APP_TREASURY_2_ACCOUNTS:-}
+      APP_TREASURY_2_ALL_ACCOUNTS: ${APP_TREASURY_2_ALL_ACCOUNTS:-false}
+
+      # No default: development features (SPRING_PROFILES_ACTIVE=dev) require APP_ENVIRONMENT=local.
+      APP_ENVIRONMENT: ${APP_ENVIRONMENT:-}
       DB_POOL_SIZE: ${DB_POOL_SIZE:-20}
+      LEDGER_REDIS_IMPORT_ENABLED: ${LEDGER_REDIS_IMPORT_ENABLED:-true}
       SPRING_PROFILES_ACTIVE: ${SPRING_PROFILES_ACTIVE:-}
+
     ports:
       - "127.0.0.1:${APP_HOST_PORT:-8080}:8080"
-    # The application writes nothing to disk; only /tmp (Tomcat work files) needs to be writable.
     read_only: true
     tmpfs:
       - /tmp

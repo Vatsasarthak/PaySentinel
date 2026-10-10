@@ -3,6 +3,7 @@ package com.pay.outbox.controller;
 import com.pay.outbox.dto.ValidationPatterns;
 import com.pay.outbox.exception.AccountNotFoundException;
 import com.pay.outbox.queue.PayoutQueue;
+import com.pay.outbox.service.AuditService;
 import com.pay.outbox.service.LedgerReconciliationService;
 import com.pay.outbox.service.LedgerService;
 import jakarta.validation.constraints.Pattern;
@@ -31,6 +32,7 @@ public class LedgerAdminController {
     private final LedgerService ledgerService;
     private final LedgerReconciliationService reconciliationService;
     private final PayoutQueue payoutQueue;
+    private final AuditService auditService;
 
     @GetMapping("/ledger/balance/{accountId}")
     public ResponseEntity<Long> getBalance(
@@ -61,6 +63,15 @@ public class LedgerAdminController {
     @GetMapping("/ledger/reconciliation")
     public ResponseEntity<LedgerReconciliationService.Report> reconcile() {
         return ResponseEntity.ok(reconciliationService.reconcile());
+    }
+
+    /** Audit trail of an account, adjustment or payout (read-only). */
+    @GetMapping("/ledger/audit/{targetType}/{targetId}")
+    public ResponseEntity<List<AuditService.AuditEvent>> audit(
+            @PathVariable @Pattern(regexp = "^(ACCOUNT|ADJUSTMENT|PAYOUT)$",
+                    message = "must be ACCOUNT, ADJUSTMENT or PAYOUT") String targetType,
+            @PathVariable @Pattern(regexp = "^[A-Za-z0-9_-]{1,64}$", message = "must be an id") String targetId) {
+        return ResponseEntity.ok(auditService.eventsFor(targetType, targetId));
     }
 
     @GetMapping("/dlq")

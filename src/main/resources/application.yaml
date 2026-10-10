@@ -1,6 +1,12 @@
 spring:
   application:
-    name: outbox
+    name: paysentinel
+
+  jackson:
+    deserialization:
+      # Amounts are integers in minor units (paise). Reject fractional JSON numbers such as 50.75 with
+      # 400 instead of silently truncating them to 50 (Jackson's default).
+      accept-float-as-int: false
 
   # Local development convenience: values from ./.env (KEY=value lines) become resolvable
   # placeholders. The file is optional and must never be committed.
@@ -58,11 +64,15 @@ management:
 
 info:
   app:
-    name: ${spring.application.name}
-    description: Payment Outbox System
+    name: PaySentinel
+    description: "Reliable Payout Processing & Ledger Reconciliation (simulated payment provider)"
     version: 1.0.0
 
 payout:
+  # Must be set explicitly. "local" permits development-only features (dev profile, seeding, loggers
+  # endpoint); "production" refuses them and every safety-reducing setting; anything else (or unset)
+  # refuses development-only features.
+  environment: ${APP_ENVIRONMENT:}
   supported-currencies: INR
   scheduling:
     enabled: true
@@ -97,6 +107,10 @@ payout:
   ledger:
     seed-enabled: false
     redis-import-enabled: ${LEDGER_REDIS_IMPORT_ENABLED:true}
+    fail-on-unmigrated-legacy-data: true
+  funding:
+    # Dual control: adjustments post only after a second, different treasury key approves them.
+    require-approval: true
   security:
     # One client is configurable through environment variables. For several clients, provide the
     # whole payout.security.clients list in an extra config file (SPRING_CONFIG_ADDITIONAL_LOCATION);
@@ -111,6 +125,19 @@ payout:
       api-key-sha256: ${APP_ADMIN_API_KEY_SHA256:}
       accounts: ${APP_ADMIN_ACCOUNTS:}
       read-all-payouts: ${APP_ADMIN_READ_ALL_PAYOUTS:false}
+    # Treasury keys move money (funding adjustments, manual-review resolutions). Slots without a key
+    # are ignored, so treasury is disabled unless keys are provided. Dual control needs two keys.
+    treasury:
+      - name: ${APP_TREASURY_1_NAME:treasury-1}
+        api-key: ${APP_TREASURY_1_API_KEY:}
+        api-key-sha256: ${APP_TREASURY_1_API_KEY_SHA256:}
+        accounts: ${APP_TREASURY_1_ACCOUNTS:}
+        all-accounts: ${APP_TREASURY_1_ALL_ACCOUNTS:false}
+      - name: ${APP_TREASURY_2_NAME:treasury-2}
+        api-key: ${APP_TREASURY_2_API_KEY:}
+        api-key-sha256: ${APP_TREASURY_2_API_KEY_SHA256:}
+        accounts: ${APP_TREASURY_2_ACCOUNTS:}
+        all-accounts: ${APP_TREASURY_2_ALL_ACCOUNTS:false}
   rate-limit:
     enabled: true
     fail-open: true

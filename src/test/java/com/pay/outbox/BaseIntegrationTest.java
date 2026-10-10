@@ -9,6 +9,7 @@ import com.pay.outbox.security.RateLimiter;
 import com.pay.outbox.service.LedgerService;
 import com.pay.outbox.service.PayoutService;
 import com.pay.outbox.service.gateway.GatewayOutcomeSource;
+import com.pay.outbox.service.gateway.SimulatedPaymentProvider;
 import com.pay.outbox.support.MutableClock;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -51,6 +52,8 @@ public abstract class BaseIntegrationTest {
     protected static final String CLIENT_KEY = "test-client-api-key-0123456789abcdef";
     protected static final String OTHER_CLIENT_KEY = "other-client-api-key-0123456789abcdef";
     protected static final String ADMIN_KEY = "test-admin-api-key-0123456789abcdef";
+    protected static final String TREASURY_A_KEY = "test-treasury-a-key-0123456789abcdef";
+    protected static final String TREASURY_B_KEY = "test-treasury-b-key-0123456789abcdef";
 
     // Singleton containers: started once per JVM and shared by every test class.
     protected static final PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16")
@@ -86,6 +89,9 @@ public abstract class BaseIntegrationTest {
     @MockitoSpyBean
     protected RateLimiter rateLimiter;
 
+    @MockitoSpyBean
+    protected SimulatedPaymentProvider simulatedProvider;
+
     @Autowired
     protected LedgerService ledgerService;
 
@@ -115,7 +121,8 @@ public abstract class BaseIntegrationTest {
     @AfterEach
     void resetState() {
         clock.reset();
-        jdbcTemplate.execute("TRUNCATE ledger_entries, ledger_accounts, outbox_events, payouts");
+        jdbcTemplate.execute(
+                "TRUNCATE audit_events, ledger_adjustments, ledger_entries, ledger_accounts, outbox_events, payouts");
         redisTemplate.execute((RedisCallback<Void>) connection -> {
             connection.serverCommands().flushDb();
             return null;
@@ -149,6 +156,12 @@ public abstract class BaseIntegrationTest {
 
     protected long held() {
         return ledgerService.getAccount(ACCOUNT).held();
+    }
+
+    protected int auditEvents(String targetId, String action) {
+        Integer count = jdbcTemplate.queryForObject(
+                "select count(*) from audit_events where target_id = ? and action = ?", Integer.class, targetId, action);
+        return count != null ? count : 0;
     }
 
     protected int ledgerEntries(UUID payoutId, String entryType) {

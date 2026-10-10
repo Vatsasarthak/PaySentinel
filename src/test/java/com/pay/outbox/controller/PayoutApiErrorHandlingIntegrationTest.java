@@ -51,7 +51,8 @@ class PayoutApiErrorHandlingIntegrationTest extends BaseIntegrationTest {
         mockMvc.perform(get("/api/v1/payouts/not-a-uuid").header("X-API-Key", CLIENT_KEY))
                 .andExpect(status().isBadRequest())
                 .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON))
-                .andExpect(jsonPath("$.title").value("Invalid Parameter"));
+                .andExpect(jsonPath("$.title").value("Invalid Parameter"))
+                .andExpect(jsonPath("$.type").value("urn:paysentinel:errors:invalid-parameter"));
     }
 
     @Test
@@ -59,6 +60,7 @@ class PayoutApiErrorHandlingIntegrationTest extends BaseIntegrationTest {
         postPayout(payoutJson(ACCOUNT, 0, "INR", "error-key-0001"))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.title").value("Validation Failed"))
+                .andExpect(jsonPath("$.type").value("urn:paysentinel:errors:validation-failed"))
                 .andExpect(jsonPath("$.errors.amount").exists());
         postPayout(payoutJson(ACCOUNT, -5, "INR", "error-key-0002"))
                 .andExpect(status().isBadRequest())
@@ -124,7 +126,7 @@ class PayoutApiErrorHandlingIntegrationTest extends BaseIntegrationTest {
         postPayout(payoutJson(ACCOUNT, 100, "INR", "error-key-0005")).andExpect(status().isAccepted());
         postPayout(payoutJson(ACCOUNT, 200, "INR", "error-key-0005"))
                 .andExpect(status().isConflict())
-                .andExpect(jsonPath("$.type").value(containsString("idempotency-key-reused")));
+                .andExpect(jsonPath("$.type").value("urn:paysentinel:errors:idempotency-key-reused"));
     }
 
     @Test

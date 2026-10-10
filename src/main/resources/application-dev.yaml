@@ -1,5 +1,6 @@
 # Development profile: enables ledger seeding and runtime log-level changes.
-# Never activate this profile in a shared or production environment.
+# Never activate this profile in a shared or production environment (APP_ENVIRONMENT=production
+# refuses to start with it).
 payout:
   ledger:
     seed-enabled: true

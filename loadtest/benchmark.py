@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Reproducible end-to-end benchmark for the Outbox Payment System (Python 3.9+, standard library only).
+Reproducible end-to-end benchmark for PaySentinel (Python 3.9+, standard library only).
 
 It seeds a ledger account, submits N payouts with C concurrent clients, then waits until every
 payout reaches a terminal state, and reports:
@@ -55,7 +55,8 @@ def main():
                         help="ledger account granted to the client key; its balance is overwritten")
     parser.add_argument("--payouts", type=int, default=1000)
     parser.add_argument("--concurrency", type=int, default=50)
-    parser.add_argument("--amount", type=int, default=100)
+    parser.add_argument("--amount", type=int, default=100,
+                        help="payout amount in whole paise (minor units); 100 = INR 1.00")
     parser.add_argument("--timeout", type=int, default=600, help="seconds to wait for processing")
     args = parser.parse_args()
 

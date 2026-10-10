@@ -28,6 +28,7 @@ public class PayoutMetrics {
     private final Counter rateLimiterErrorCounter;
     private final Counter gatewayReplayCounter;
     private final Counter ledgerImportCounter;
+    private final Counter manualReviewCounter;
     private final AtomicInteger reconciliationMismatches = new AtomicInteger();
     private final MeterRegistry registry;
 
@@ -56,6 +57,8 @@ public class PayoutMetrics {
                 "Provider requests answered from an earlier request with the same idempotency key");
         this.ledgerImportCounter = counter(registry, "ledger.redis_import.accounts",
                 "Legacy Redis ledger accounts imported into PostgreSQL");
+        this.manualReviewCounter = counter(registry, "payout.manual_review",
+                "Payouts parked for manual review because the provider outcome was unknown");
         Gauge.builder("ledger.reconciliation.mismatches", reconciliationMismatches, AtomicInteger::get)
                 .description("Inconsistencies found by the last ledger reconciliation")
                 .register(registry);
@@ -86,5 +89,6 @@ public class PayoutMetrics {
     public void incrementRateLimiterError() { rateLimiterErrorCounter.increment(); }
     public void incrementGatewayReplay() { gatewayReplayCounter.increment(); }
     public void incrementLedgerImport() { ledgerImportCounter.increment(); }
+    public void incrementManualReview() { manualReviewCounter.increment(); }
     public void setReconciliationMismatches(int count) { reconciliationMismatches.set(count); }
 }

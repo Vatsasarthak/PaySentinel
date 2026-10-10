@@ -13,7 +13,15 @@ public final class ValidationPatterns {
     public static final String IDEMPOTENCY_KEY = "^[A-Za-z0-9._:-]{8,128}$";
     public static final String IDEMPOTENCY_KEY_MESSAGE = "must be 8-128 characters: letters, digits, '.', '_', ':' or '-'";
 
-    /** Upper bound on a single payout or seeded balance, in integer currency units. */
+    /**
+     * Upper bound on a single payout, adjustment or seeded balance: 1,000,000,000,000 minor units
+     * (for INR, paise: Rs 10,000,000,000.00).
+     * <p>
+     * Amount convention: every amount and balance in this application is a whole number of the
+     * currency's minor unit (paise for INR, so 5000 means Rs 50.00). This is a convention of this
+     * application; the payment provider is simulated and no real conversion or settlement happens.
+     * Fractional JSON numbers are rejected rather than truncated (spring.jackson.deserialization).
+     */
     public static final long MAX_AMOUNT = 1_000_000_000_000L;
 
     private ValidationPatterns() {

@@ -52,21 +52,55 @@ public interface PayoutRepository extends JpaRepository<Payout, UUID> {
     @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("""
             update Payout p
-               set p.status = :failed, p.fundsStatus = :released, p.failureReason = :reason,
-                   p.leaseUntil = null, p.updatedAt = :now
+               set p.status = :to, p.fundsStatus = :funds, p.failureReason = :reason,
+                   p.providerReference = :providerReference, p.leaseUntil = null, p.updatedAt = :now
              where p.id = :id and p.fundsStatus = :held and p.attempts >= :maxAttempts
                and (p.status = :pending or (p.status = :processing and p.leaseUntil < :now))""")
-    int exhaustDeliveries(UUID id, String reason, Instant now, int maxAttempts, PayoutStatus pending,
-                          PayoutStatus processing, PayoutStatus failed, FundsStatus held, FundsStatus released);
+    int resolveExhausted(UUID id, PayoutStatus to, FundsStatus funds, String reason, String providerReference,
+                         Instant now, int maxAttempts, PayoutStatus pending, PayoutStatus processing,
+                         FundsStatus held);
 
     /**
-     * Fails a payout whose delivery budget is spent, provided nobody holds a live lease on it.
-     * Must run in the same transaction as the ledger release.
+     * Settles the fate of a payout whose delivery budget is spent (and on which nobody holds a live
+     * lease), based on what the provider reports. Must run in the same transaction as the matching
+     * ledger settlement or release; MANUAL_REVIEW keeps the funds held.
      */
-    default int exhaustDeliveries(UUID id, String reason, Instant now, int maxAttempts) {
-        return exhaustDeliveries(id, reason, now, maxAttempts, PayoutStatus.PENDING, PayoutStatus.PROCESSING,
-                PayoutStatus.FAILED, FundsStatus.HELD, FundsStatus.RELEASED);
+    default int resolveExhausted(UUID id, PayoutStatus to, FundsStatus funds, String reason,
+                                 String providerReference, Instant now, int maxAttempts) {
+        return resolveExhausted(id, to, funds, reason, providerReference, now, maxAttempts, PayoutStatus.PENDING,
+                PayoutStatus.PROCESSING, FundsStatus.HELD);
     }
+
+    @Transactional
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query("""
+            update Payout p
+               set p.status = :review, p.failureReason = :reason, p.leaseUntil = null, p.updatedAt = :now
+             where p.id = :id and p.status = :processing and p.attempts = :attempt""")
+    int markForReview(UUID id, int attempt, String reason, Instant now, PayoutStatus processing, PayoutStatus review);
+
+    /** Parks a claimed payout in MANUAL_REVIEW (funds stay held), fenced by the claim's attempt number. */
+    default int markForReview(UUID id, int attempt, String reason, Instant now) {
+        return markForReview(id, attempt, reason, now, PayoutStatus.PROCESSING, PayoutStatus.MANUAL_REVIEW);
+    }
+
+    @Transactional
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query("""
+            update Payout p
+               set p.status = :to, p.fundsStatus = :funds, p.failureReason = :reason,
+                   p.providerReference = :providerReference, p.updatedAt = :now
+             where p.id = :id and p.status = :review""")
+    int resolveReview(UUID id, PayoutStatus to, FundsStatus funds, String reason, String providerReference,
+                      Instant now, PayoutStatus review);
+
+    /** Leaves MANUAL_REVIEW exactly once; must run in the same transaction as the ledger settle or release. */
+    default int resolveReview(UUID id, PayoutStatus to, FundsStatus funds, String reason, String providerReference,
+                              Instant now) {
+        return resolveReview(id, to, funds, reason, providerReference, now, PayoutStatus.MANUAL_REVIEW);
+    }
+
+    List<Payout> findByStatusOrderByUpdatedAt(PayoutStatus status, Pageable page);
 
     @Transactional
     @Modifying(clearAutomatically = true, flushAutomatically = true)

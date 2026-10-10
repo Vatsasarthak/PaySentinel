@@ -1,5 +1,6 @@
 package com.pay.outbox.service;
 
+import com.pay.outbox.domain.enums.PayoutStatus;
 import com.pay.outbox.dto.PayoutMessage;
 import com.pay.outbox.exception.PaymentExhaustedException;
 import com.pay.outbox.exception.PaymentHangException;
@@ -16,16 +17,40 @@ import org.springframework.retry.annotation.Retryable;
 import org.springframework.stereotype.Service;
 
 import java.util.Optional;
+import java.util.UUID;
 
 /**
  * Sends payouts to the payment provider. Every attempt for a payout (backoff retries, redeliveries
  * after a crash, other workers) uses the same idempotency key, {@code payout-<payoutId>}, so the
  * provider executes the payment at most once.
+ * <p>
+ * Money only moves on a definitive provider answer: a completed payment is settled, a declined or
+ * never-received one is refunded. When the provider cannot say (request still in flight, or the
+ * provider is unreachable), the outcome is reported as unknown and nothing is refunded.
  */
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class PaymentGatewayService {
+
+    /** What the provider knows about a payout's request. */
+    public enum ProviderState {
+        COMPLETED,
+        FAILED,
+        /** A request with this key is still being processed: the payment may yet complete. */
+        IN_PROGRESS,
+        /** The provider confirms it never executed a request with this key. */
+        NOT_FOUND,
+        /** The provider could not be asked (error or timeout): the outcome is unknown. */
+        UNAVAILABLE;
+
+        public boolean definitive() {
+            return this == COMPLETED || this == FAILED;
+        }
+    }
+
+    public record ProviderCheck(ProviderState state, String providerReference) {
+    }
 
     private final PaymentProvider paymentProvider;
     private final PayoutMetrics payoutMetrics;
@@ -54,27 +79,48 @@ public class PaymentGatewayService {
     }
 
     /**
-     * After the last timeout the outcome is unknown, so ask the provider before giving up: if it did
-     * execute the payment, that result stands and the payout is not refunded; if the request is still
-     * in progress, the payout must not be failed (or refunded) yet.
+     * After the last timeout, ask the provider before deciding: a final result stands; a request the
+     * provider never executed is reported as exhausted (safe to refund); anything else is unknown.
      */
     @Recover
     public ProviderResponse recover(PaymentHangException e, PayoutMessage message) {
-        String key = PaymentInstruction.idempotencyKeyFor(message.payoutId());
-        Optional<ProviderResponse> known = paymentProvider.lookup(key);
-        if (known.isPresent()) {
-            log.warn("Provider calls for payout {} timed out but the provider reports {}; using that result",
-                    message.payoutId(), known.get().status());
-            return known.get();
+        ProviderCheck check = checkProvider(message.payoutId());
+        return switch (check.state()) {
+            case COMPLETED, FAILED -> {
+                log.warn("Provider calls for payout {} timed out but the provider reports {}; using that result",
+                        message.payoutId(), check.state());
+                yield new ProviderResponse(PayoutStatus.valueOf(check.state().name()), check.providerReference());
+            }
+            case NOT_FOUND -> {
+                log.error("All provider attempts timed out for payout {} and the provider never executed it",
+                        message.payoutId());
+                throw new PaymentExhaustedException("All retries exhausted for payout " + message.payoutId());
+            }
+            case IN_PROGRESS, UNAVAILABLE -> {
+                log.warn("Outcome of payout {} is unknown (provider state {}); it will not be refunded",
+                        message.payoutId(), check.state());
+                throw new PaymentOutcomeUnknownException("Provider outcome for payout " + message.payoutId()
+                        + " is unknown: " + check.state());
+            }
+        };
+    }
+
+    /** Asks the provider about a payout's request. Never throws: a failed lookup is UNAVAILABLE. */
+    public ProviderCheck checkProvider(UUID payoutId) {
+        String key = PaymentInstruction.idempotencyKeyFor(payoutId);
+        try {
+            Optional<ProviderResponse> result = paymentProvider.lookup(key);
+            if (result.isPresent()) {
+                return result.get().status() == PayoutStatus.COMPLETED
+                        ? new ProviderCheck(ProviderState.COMPLETED, result.get().providerReference())
+                        : new ProviderCheck(ProviderState.FAILED, null);
+            }
+            return new ProviderCheck(paymentProvider.isInProgress(key) ? ProviderState.IN_PROGRESS
+                    : ProviderState.NOT_FOUND, null);
+        } catch (RuntimeException e) {
+            log.warn("Could not look up provider result for payout {}", payoutId, e);
+            return new ProviderCheck(ProviderState.UNAVAILABLE, null);
         }
-        if (paymentProvider.isInProgress(key)) {
-            log.warn("Provider is still processing payout {}; leaving it unresolved for redelivery", message.payoutId());
-            throw new PaymentOutcomeUnknownException("Provider request for payout " + message.payoutId()
-                    + " is still in progress");
-        }
-        log.error("All provider attempts timed out for payout {} and the provider has no record of it",
-                message.payoutId());
-        throw new PaymentExhaustedException("All retries exhausted for payout " + message.payoutId());
     }
 
     private static PaymentInstruction instructionFor(PayoutMessage message) {

@@ -64,6 +64,32 @@ class SecurityConfigTest {
     }
 
     @Test
+    void treasuryKeysAreOptionalExplicitlyScopedAndSeparateFromAdmin() {
+        PayoutProperties properties = properties(client("merchant-a", KEY_A, "acct_1"));
+        PayoutProperties.Treasurer unconfigured = new PayoutProperties.Treasurer();
+        unconfigured.setName("treasury-1");
+        PayoutProperties.Treasurer treasurer = new PayoutProperties.Treasurer();
+        treasurer.setName("treasury-2");
+        treasurer.setApiKey(KEY_B);
+        treasurer.setAccounts(List.of("acct_1"));
+        properties.getSecurity().setTreasury(List.of(unconfigured, treasurer));
+
+        List<Credential> credentials = SecurityConfig.credentials(properties);
+
+        assertThat(credentials).extracting(c -> c.principal().role()).containsExactly("CLIENT", "TREASURY", "ADMIN");
+        assertThat(credentials.get(1).principal().mayUseAccount("acct_1")).isTrue();
+        assertThat(credentials.get(1).principal().mayUseAccount("acct_2")).isFalse();
+
+        treasurer.setAccounts(List.of());
+        assertThatThrownBy(() -> SecurityConfig.credentials(properties)).hasMessageContaining("all-accounts");
+        treasurer.setAllAccounts(true);
+        assertThat(SecurityConfig.credentials(properties).get(1).principal().mayUseAccount("anything")).isTrue();
+
+        treasurer.setName("system");
+        assertThatThrownBy(() -> SecurityConfig.credentials(properties)).hasMessageContaining("reserved");
+    }
+
+    @Test
     void rejectsUnsafeConfigurations() {
         assertThatThrownBy(() -> SecurityConfig.credentials(properties()))
                 .hasMessageContaining("At least one API client");

@@ -34,7 +34,20 @@ public class SchedulingConfig implements SchedulingConfigurer {
         ThreadPoolTaskScheduler scheduler = new ThreadPoolTaskScheduler();
         scheduler.setPoolSize(poolSize);
         scheduler.setThreadNamePrefix("scheduler-");
-        scheduler.setWaitForTasksToCompleteOnShutdown(true);
+        // Must stay false. With false, the context-close event stops new runs without interrupting the
+        // running ones, and the scheduler's lifecycle stop waits for running jobs before lower-phase
+        // beans such as the Redis connection factory stop. With true, Spring skips that wait and only
+        // waits during bean destruction, after Redis has stopped, so a relay still running at shutdown
+        // could not release its ShedLock lock ("LockException: Can not remove node", caused by
+        // "LettuceConnectionFactory is STOPPING"). SchedulerShutdownIntegrationTest covers this.
+        //
+        // Limitation: the lifecycle wait is bounded by spring.lifecycle.timeout-per-shutdown-phase
+        // (30 seconds by default). A job still running after that is interrupted at bean destruction
+        // and given up to awaitTerminationSeconds more. Nothing is lost: an interrupted relay leaves its
+        // events PENDING (re-published on the next run, de-duplicated by the worker), an unreleased
+        // ShedLock lock expires after lockAtMostFor, and a payout left mid-processing is redelivered
+        // after its lease and the queue visibility timeout expire.
+        scheduler.setWaitForTasksToCompleteOnShutdown(false);
         scheduler.setAwaitTerminationSeconds(30);
         return scheduler;
     }

@@ -6,12 +6,14 @@ import com.pay.outbox.domain.enums.FundsStatus;
 import com.pay.outbox.domain.enums.PayoutStatus;
 import com.pay.outbox.service.gateway.GatewayOutcome;
 import com.pay.outbox.worker.PaymentProcessingWorker;
+import com.pay.outbox.config.PayoutProperties;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.when;
 
@@ -33,6 +35,9 @@ class RedisLedgerImporterIntegrationTest extends BaseIntegrationTest {
 
     @Autowired
     private PaymentProcessingWorker worker;
+
+    @Autowired
+    private PayoutProperties properties;
 
     private UUID legacyPayout(String account, long amount, String status, String fundsStatus, String marker) {
         UUID id = UUID.randomUUID();
@@ -134,6 +139,74 @@ class RedisLedgerImporterIntegrationTest extends BaseIntegrationTest {
         assertThat(report.alreadyImported()).containsExactly("legacy_d");
         assertThat(ledgerService.getBalance("legacy_d")).isEqualTo(50);
         assertThat(redisTemplate.hasKey("ledger:legacy_d")).isFalse();
+    }
+
+    @Test
+    void importInterruptedMidAccountRollsBackThatAccountAndResumesOnRestart() {
+        redisTemplate.opsForValue().set("ledger:legacy_e", "100");
+        redisTemplate.opsForValue().set("ledger:legacy_f", "400");
+        UUID held = legacyPayout("legacy_f", 60, "PENDING", "LEGACY_HELD", null);
+        // Simulate a crash while legacy_f is being imported (after its opening balance is written).
+        jdbcTemplate.execute("""
+                CREATE OR REPLACE FUNCTION fail_hold_insert() RETURNS trigger AS $$
+                BEGIN IF NEW.entry_type = 'HOLD' THEN RAISE EXCEPTION 'simulated crash during import'; END IF;
+                RETURN NEW; END; $$ LANGUAGE plpgsql""");
+        jdbcTemplate.execute("""
+                CREATE TRIGGER fail_hold BEFORE INSERT ON ledger_entries
+                FOR EACH ROW EXECUTE FUNCTION fail_hold_insert()""");
+        try {
+            assertThatThrownBy(importer::importLegacyLedger).hasMessageContaining("simulated crash");
+        } finally {
+            jdbcTemplate.execute("DROP TRIGGER IF EXISTS fail_hold ON ledger_entries");
+        }
+
+        // legacy_e (imported first) is complete; legacy_f was rolled back entirely and left untouched.
+        assertThat(ledgerService.getBalance("legacy_e")).isEqualTo(100);
+        assertThat(ledgerService.getAccount("legacy_f")).isNull();
+        assertThat(redisTemplate.opsForValue().get("ledger:legacy_f")).isEqualTo("400");
+        assertFunds(held, PayoutStatus.PENDING, FundsStatus.LEGACY_HELD);
+        assertThat(importer.unmigratedAccounts()).containsExactly("legacy_f");
+        assertThatThrownBy(importer::verifyNoUnmigratedLegacyData).hasMessageContaining("legacy_f");
+
+        // A restart resumes and completes the import.
+        RedisLedgerImporter.ImportReport report = importer.importLegacyLedger();
+
+        assertThat(report.imported()).containsExactly("legacy_f");
+        assertThat(ledgerService.getAccount("legacy_f")).isEqualTo(new LedgerService.AccountBalance("legacy_f", 400, 60));
+        assertFunds(held, PayoutStatus.PENDING, FundsStatus.HELD);
+        assertThat(importer.unmigratedAccounts()).isEmpty();
+        importer.verifyNoUnmigratedLegacyData();
+        assertThat(reconciliationService.reconcile().consistent()).isTrue();
+    }
+
+    @Test
+    void startupIsRefusedWhileLegacyDataCannotBeImported() {
+        ledgerService.seedBalance("native_acct", 999);
+        redisTemplate.opsForValue().set("ledger:native_acct", "123");
+
+        assertThatThrownBy(importer::afterSingletonsInstantiated)
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("native_acct");
+
+        properties.getLedger().setFailOnUnmigratedLegacyData(false);
+        try {
+            importer.afterSingletonsInstantiated(); // logs instead of failing, for investigation only
+        } finally {
+            properties.getLedger().setFailOnUnmigratedLegacyData(true);
+        }
+        assertThat(ledgerService.getBalance("native_acct")).isEqualTo(999);
+    }
+
+    @Test
+    void startupIsRefusedWhenTheImportIsDisabledButLegacyDataExists() {
+        redisTemplate.opsForValue().set("ledger:legacy_g", "10");
+        properties.getLedger().setRedisImportEnabled(false);
+        try {
+            assertThatThrownBy(importer::afterSingletonsInstantiated).hasMessageContaining("legacy_g");
+        } finally {
+            properties.getLedger().setRedisImportEnabled(true);
+        }
+        assertThat(ledgerService.getAccount("legacy_g")).isNull();
     }
 
     private void assertFunds(UUID id, PayoutStatus status, FundsStatus funds) {

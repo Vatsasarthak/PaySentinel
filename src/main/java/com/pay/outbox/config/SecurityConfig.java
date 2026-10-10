@@ -23,8 +23,8 @@ import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.authentication.AnonymousAuthenticationFilter;
 
 import java.util.ArrayList;
-import java.util.HexFormat;
 import java.util.HashSet;
+import java.util.HexFormat;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
@@ -32,26 +32,28 @@ import java.util.Set;
 import java.util.regex.Pattern;
 
 /**
- * Stateless API-key security.
+ * Stateless API-key security with three roles and separated duties:
  * <ul>
- *   <li>CLIENT keys may create and read payouts only for the ledger accounts they are granted.</li>
- *   <li>The ADMIN key may use the ledger, dead-letter and protected actuator endpoints. It does not
- *       bypass account ownership: it can create payouts only for accounts explicitly granted to it,
- *       and read all payouts only if {@code payout.security.admin.read-all-payouts=true}.</li>
+ *   <li>CLIENT keys create and read payouts only for the ledger accounts they are granted.</li>
+ *   <li>The ADMIN key operates the system (ledger inspection, dead letters, reconciliation, protected
+ *       actuator endpoints). It cannot move money: no funding, and payouts only for accounts explicitly
+ *       granted to it.</li>
+ *   <li>TREASURY keys (none by default) request, approve and reject funding adjustments and resolve
+ *       payouts in manual review, for their granted accounts. They cannot create payouts.</li>
  * </ul>
- * Keys (or their SHA-256 digests) come from the environment; the application refuses to start
- * with a missing, short, placeholder or duplicated key.
+ * Keys (or their SHA-256 digests) come from the environment; the application refuses to start with a
+ * missing, short, placeholder or duplicated key.
  */
 @Configuration
 @EnableWebSecurity
 public class SecurityConfig {
 
     static final int MIN_KEY_LENGTH = 32;
-    private static final Pattern CLIENT_NAME = Pattern.compile("^[A-Za-z0-9_.-]{1,64}$");
+    private static final Pattern PRINCIPAL_NAME = Pattern.compile("^[A-Za-z0-9_.-]{1,64}$");
     private static final Pattern ACCOUNT_ID = Pattern.compile(ValidationPatterns.ACCOUNT_ID);
     private static final Pattern SHA256_HEX = Pattern.compile("^[0-9a-fA-F]{64}$");
-    /** Reserved: "legacy" owns payouts created before client scoping; "admin" is the admin principal. */
-    private static final Set<String> RESERVED_NAMES = Set.of("legacy", "admin");
+    /** Reserved: "legacy" owns pre-V4 payouts, "admin" is the admin principal, "system" signs automated audit entries. */
+    private static final Set<String> RESERVED_NAMES = Set.of("legacy", "admin", "system");
 
     @Bean
     public SecurityFilterChain securityFilterChain(HttpSecurity http, PayoutProperties properties,
@@ -76,6 +78,7 @@ public class SecurityConfig {
                         .requestMatchers("/error").permitAll()
                         .requestMatchers(EndpointRequest.to(HealthEndpoint.class, InfoEndpoint.class)).permitAll()
                         .requestMatchers(EndpointRequest.toAnyEndpoint()).hasRole("ADMIN")
+                        .requestMatchers("/api/v1/treasury/**").hasRole("TREASURY")
                         .requestMatchers("/api/v1/payouts/ledger/**", "/api/v1/payouts/dlq").hasRole("ADMIN")
                         // Account ownership for payouts is enforced in PayoutController.
                         .requestMatchers(HttpMethod.POST, "/api/v1/payouts").hasAnyRole("CLIENT", "ADMIN")
@@ -96,26 +99,33 @@ public class SecurityConfig {
         Set<String> names = new HashSet<>();
 
         for (PayoutProperties.Client client : security.getClients()) {
-            String name = client.getName();
-            if (name == null || !CLIENT_NAME.matcher(name).matches()) {
-                throw new IllegalStateException("payout.security.clients[].name must match " + CLIENT_NAME.pattern());
-            }
-            if (RESERVED_NAMES.contains(name.toLowerCase(Locale.ROOT)) || !names.add(name)) {
-                throw new IllegalStateException("API client name '" + name + "' is reserved or duplicated");
-            }
-            String label = "API key of client '" + name + "'";
+            String label = principalLabel("client", client.getName(), names);
             byte[] digest = keyDigest(label, client.getApiKey(), client.getApiKeySha256());
-            credentials.add(new Credential(new ApiPrincipal(name, "CLIENT", accounts(label, client.getAccounts()), false),
-                    digest));
+            credentials.add(new Credential(new ApiPrincipal(client.getName(), "CLIENT",
+                    accounts(label, client.getAccounts()), false, false), digest));
         }
         if (credentials.isEmpty()) {
             throw new IllegalStateException("At least one API client must be configured (payout.security.clients)");
         }
 
+        for (PayoutProperties.Treasurer treasurer : security.getTreasury()) {
+            if (isBlank(treasurer.getApiKey()) && isBlank(treasurer.getApiKeySha256())) {
+                continue; // an unconfigured slot: treasury is disabled unless keys are provided
+            }
+            String label = principalLabel("treasury", treasurer.getName(), names);
+            Set<String> accounts = accounts(label, treasurer.getAccounts());
+            if (accounts.isEmpty() && !treasurer.isAllAccounts()) {
+                throw new IllegalStateException(label + " must be granted accounts or all-accounts=true");
+            }
+            credentials.add(new Credential(new ApiPrincipal(treasurer.getName(), "TREASURY", accounts,
+                    treasurer.isAllAccounts(), false),
+                    keyDigest(label, treasurer.getApiKey(), treasurer.getApiKeySha256())));
+        }
+
         PayoutProperties.Admin admin = security.getAdmin();
-        String label = "admin API key";
-        credentials.add(new Credential(new ApiPrincipal("admin", "ADMIN", accounts(label, admin.getAccounts()),
-                admin.isReadAllPayouts()), keyDigest(label, admin.getApiKey(), admin.getApiKeySha256())));
+        String adminLabel = "admin API key";
+        credentials.add(new Credential(new ApiPrincipal("admin", "ADMIN", accounts(adminLabel, admin.getAccounts()),
+                false, admin.isReadAllPayouts()), keyDigest(adminLabel, admin.getApiKey(), admin.getApiKeySha256())));
 
         Set<String> digests = new HashSet<>();
         for (Credential credential : credentials) {
@@ -124,6 +134,16 @@ public class SecurityConfig {
             }
         }
         return credentials;
+    }
+
+    private static String principalLabel(String kind, String name, Set<String> names) {
+        if (name == null || !PRINCIPAL_NAME.matcher(name).matches()) {
+            throw new IllegalStateException("API " + kind + " names must match " + PRINCIPAL_NAME.pattern());
+        }
+        if (RESERVED_NAMES.contains(name.toLowerCase(Locale.ROOT)) || !names.add(name)) {
+            throw new IllegalStateException("API " + kind + " name '" + name + "' is reserved or duplicated");
+        }
+        return "API key of " + kind + " '" + name + "'";
     }
 
     private static Set<String> accounts(String label, List<String> configured) {
@@ -142,8 +162,8 @@ public class SecurityConfig {
     }
 
     private static byte[] keyDigest(String label, String plainKey, String sha256Hex) {
-        boolean hasPlain = plainKey != null && !plainKey.isBlank();
-        boolean hasHash = sha256Hex != null && !sha256Hex.isBlank();
+        boolean hasPlain = !isBlank(plainKey);
+        boolean hasHash = !isBlank(sha256Hex);
         if (hasPlain == hasHash) {
             throw new IllegalStateException(label + ": set exactly one of api-key or api-key-sha256");
         }
@@ -161,5 +181,9 @@ public class SecurityConfig {
             throw new IllegalStateException(label + " still contains the placeholder from .env.example");
         }
         return ApiKeyAuthenticationFilter.sha256(plainKey);
+    }
+
+    private static boolean isBlank(String value) {
+        return value == null || value.isBlank();
     }
 }

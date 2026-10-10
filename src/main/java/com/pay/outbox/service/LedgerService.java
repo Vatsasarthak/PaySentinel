@@ -1,5 +1,7 @@
 package com.pay.outbox.service;
 
+import com.pay.outbox.exception.AccountNotFoundException;
+import com.pay.outbox.exception.InsufficientBalanceException;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -36,6 +38,7 @@ public class LedgerService {
 
     public enum SettleResult { SETTLED, ALREADY_SETTLED, NOTHING_HELD, RELEASED_CONFLICT }
 
+    /** Balances in whole minor units of the account's currency (paise for INR). */
     public record AccountBalance(String accountId, long available, long held) {
     }
 
@@ -49,6 +52,7 @@ public class LedgerService {
 
     private final JdbcTemplate jdbc;
     private final Clock clock;
+    private final AuditService auditService;
 
     /** Moves {@code amount} from available to held for a payout. Idempotent per payout. */
     @Transactional(propagation = Propagation.MANDATORY)
@@ -108,10 +112,59 @@ public class LedgerService {
     /** Sets an account's available balance, creating the account if needed (development seeding). */
     @Transactional
     public void seedBalance(String accountId, long amount) {
+        seedBalance(accountId, amount, "system");
+    }
+
+    /** Development seeding with the acting principal recorded in the audit log. */
+    @Transactional
+    public void seedBalance(String accountId, long amount, String actor) {
         createAccountIfAbsent(accountId);
         AccountBalance account = lockAccount(accountId);
         apply(account, null, "ADJUSTMENT", amount - account.available(), 0, "ADJUSTMENT:" + UUID.randomUUID());
+        auditService.record(actor, "LEDGER_BALANCE_SEEDED", "ACCOUNT", accountId,
+                AuditService.details("previousAvailable", account.available(), "newAvailable", amount));
         log.info("Set available balance of account {} to {}", accountId, amount);
+    }
+
+    /**
+     * Adds funds to an account's available balance, creating the account when {@code createIfMissing}.
+     * Idempotent per {@code idempotencyKey}: a repeated call returns the balance without crediting again.
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public AccountBalance credit(String accountId, long amount, String idempotencyKey, boolean createIfMissing) {
+        requirePositive(amount);
+        if (createIfMissing) {
+            createAccountIfAbsent(accountId);
+        }
+        AccountBalance account = lockAccount(accountId);
+        if (account == null) {
+            throw new AccountNotFoundException("Ledger account not found: " + accountId);
+        }
+        if (entryExists(idempotencyKey)) {
+            return account;
+        }
+        return apply(account, null, "CREDIT", amount, 0, idempotencyKey);
+    }
+
+    /**
+     * Removes funds from an account's available balance; held funds can never be debited and the
+     * balance never goes negative. Idempotent per {@code idempotencyKey}.
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public AccountBalance debit(String accountId, long amount, String idempotencyKey) {
+        requirePositive(amount);
+        AccountBalance account = lockAccount(accountId);
+        if (account == null) {
+            throw new AccountNotFoundException("Ledger account not found: " + accountId);
+        }
+        if (entryExists(idempotencyKey)) {
+            return account;
+        }
+        if (account.available() < amount) {
+            throw new InsufficientBalanceException("Insufficient available balance on account " + accountId
+                    + " for a debit of " + amount);
+        }
+        return apply(account, null, "DEBIT", -amount, 0, idempotencyKey);
     }
 
     /**
@@ -186,8 +239,14 @@ public class LedgerService {
         return rows.isEmpty() ? null : rows.get(0);
     }
 
-    private void apply(AccountBalance account, UUID payoutId, String entryType, long availableDelta, long heldDelta,
-                       String idempotencyKey) {
+    private static void requirePositive(long amount) {
+        if (amount <= 0) {
+            throw new IllegalArgumentException("Ledger amounts must be positive");
+        }
+    }
+
+    private AccountBalance apply(AccountBalance account, UUID payoutId, String entryType, long availableDelta,
+                                 long heldDelta, String idempotencyKey) {
         long available = Math.addExact(account.available(), availableDelta);
         long held = Math.addExact(account.held(), heldDelta);
         if (available < 0 || held < 0) {
@@ -205,6 +264,7 @@ public class LedgerService {
                 idempotencyKey, now);
         log.info("Ledger {} on account {} (payout {}): available {} -> {}, held {} -> {}", entryType,
                 account.accountId(), payoutId, account.available(), available, account.held(), held);
+        return new AccountBalance(account.accountId(), available, held);
     }
 
     private OffsetDateTime now() {

@@ -16,7 +16,6 @@ import org.springframework.web.context.request.WebRequest;
 import org.springframework.web.method.annotation.HandlerMethodValidationException;
 import org.springframework.web.servlet.mvc.method.annotation.ResponseEntityExceptionHandler;
 
-import java.net.URI;
 import java.util.Map;
 import java.util.TreeMap;
 
@@ -28,8 +27,6 @@ import java.util.TreeMap;
 @Slf4j
 @RestControllerAdvice
 public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
-
-    private static final String BASE_URL = "https://outbox-payments.com/errors";
 
     @ExceptionHandler(PayoutNotFoundException.class)
     public ProblemDetail handlePayoutNotFound(PayoutNotFoundException ex) {
@@ -60,6 +57,23 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
     @ExceptionHandler(InvalidRequestException.class)
     public ProblemDetail handleInvalidRequest(InvalidRequestException ex) {
         return validationProblem(Map.of(ex.getField(), ex.getMessage()));
+    }
+
+    @ExceptionHandler(ResourceNotFoundException.class)
+    public ProblemDetail handleResourceNotFound(ResourceNotFoundException ex) {
+        return problem(HttpStatus.NOT_FOUND, "Not Found", "not-found", ex.getMessage());
+    }
+
+    @ExceptionHandler(StateConflictException.class)
+    public ProblemDetail handleStateConflict(StateConflictException ex) {
+        log.warn("State conflict: {}", ex.getMessage());
+        return problem(HttpStatus.CONFLICT, "State Conflict", "state-conflict", ex.getMessage());
+    }
+
+    @ExceptionHandler(FourEyesViolationException.class)
+    public ProblemDetail handleFourEyes(FourEyesViolationException ex) {
+        log.warn("Dual-control violation: {}", ex.getMessage());
+        return problem(HttpStatus.FORBIDDEN, "Second Approver Required", "four-eyes-required", ex.getMessage());
     }
 
     @ExceptionHandler(AccountAccessDeniedException.class)
@@ -129,7 +143,7 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler {
     private static ProblemDetail problem(HttpStatus status, String title, String type, String detail) {
         ProblemDetail problem = ProblemDetail.forStatusAndDetail(status, detail);
         problem.setTitle(title);
-        problem.setType(URI.create(BASE_URL + "/" + type));
+        problem.setType(ProblemTypes.of(type));
         return problem;
     }
 }

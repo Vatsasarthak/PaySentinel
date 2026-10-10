@@ -47,7 +47,8 @@ class PayoutApiSecurityIntegrationTest extends BaseIntegrationTest {
                 .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON))
                 .andExpect(header().string("WWW-Authenticate", containsString("X-API-Key")))
                 .andExpect(jsonPath("$.title").value("Unauthorized"))
-                .andExpect(jsonPath("$.status").value(401));
+                .andExpect(jsonPath("$.status").value(401))
+                .andExpect(jsonPath("$.type").value("urn:paysentinel:errors:unauthorized"));
     }
 
     @Test
@@ -76,7 +77,7 @@ class PayoutApiSecurityIntegrationTest extends BaseIntegrationTest {
         createPayout(CLIENT_KEY, OTHER_ACCOUNT, "security-key-04")
                 .andExpect(status().isForbidden())
                 .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON))
-                .andExpect(jsonPath("$.type").value(containsString("account-access-denied")));
+                .andExpect(jsonPath("$.type").value("urn:paysentinel:errors:account-access-denied"));
 
         assertNoPayouts();
         org.assertj.core.api.Assertions.assertThat(ledgerService.getBalance(OTHER_ACCOUNT)).isEqualTo(10_000L);

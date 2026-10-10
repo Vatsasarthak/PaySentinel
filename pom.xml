@@ -11,7 +11,7 @@
 	<groupId>com.pay</groupId>
 	<artifactId>outbox</artifactId>
 	<version>0.0.1-SNAPSHOT</version>
-	<name>outbox-payment-system</name>
+	<name>PaySentinel</name>
 	<description>Simulated payout processing service built on the transactional outbox pattern</description>
 
 	<properties>

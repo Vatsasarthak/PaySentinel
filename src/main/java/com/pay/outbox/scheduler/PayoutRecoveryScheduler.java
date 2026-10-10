@@ -27,6 +27,7 @@ public class PayoutRecoveryScheduler {
         Instant now = clock.instant();
         runStep("abandoned message recovery", () -> recoveryService.recoverAbandonedMessages(now));
         runStep("pending refunds", recoveryService::completePendingReleases);
+        runStep("manual review provider re-check", recoveryService::recheckManualReviews);
         runStep("stuck payout re-publication", () -> recoveryService.rearmStuckPayouts(now));
     }
 

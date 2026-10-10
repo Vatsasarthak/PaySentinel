@@ -14,6 +14,7 @@ public class PayoutRequest {
     @Pattern(regexp = ValidationPatterns.ACCOUNT_ID, message = ValidationPatterns.ACCOUNT_ID_MESSAGE)
     private String recipientId;
 
+    /** Whole minor units of {@link #currency} (paise for INR: 5000 = Rs 50.00); see ValidationPatterns. */
     @NotNull(message = "Amount is required")
     @Positive(message = "Amount must be greater than 0")
     @Max(value = ValidationPatterns.MAX_AMOUNT, message = "Amount exceeds the maximum allowed")

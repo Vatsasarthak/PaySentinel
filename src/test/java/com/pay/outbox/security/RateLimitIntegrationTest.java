@@ -78,7 +78,7 @@ class RateLimitIntegrationTest extends BaseIntegrationTest {
         create(CLIENT_KEY, ACCOUNT)
                 .andExpect(status().isTooManyRequests())
                 .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON))
-                .andExpect(jsonPath("$.type").value(org.hamcrest.Matchers.containsString("rate-limited")))
+                .andExpect(jsonPath("$.type").value("urn:paysentinel:errors:rate-limited"))
                 .andExpect(header().string("Retry-After", org.hamcrest.Matchers.matchesPattern("([1-5][0-9]|60|[1-9])")));
         assertThat(payoutRepository.count()).isEqualTo(3); // the rejected request had no effect
 

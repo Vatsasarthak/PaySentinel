@@ -36,6 +36,7 @@ public class PayoutRecoveryService {
     private final PayoutMetrics payoutMetrics;
     private final PayoutProperties properties;
     private final TransactionTemplate transactionTemplate;
+    private final PayoutReviewService reviewService;
     private final Clock clock;
 
     /** Re-queues messages left in the processing list by a worker that died. */
@@ -114,6 +115,11 @@ public class PayoutRecoveryService {
             }
         }
         return rearmed;
+    }
+
+    /** Resolves payouts in manual review for which the provider now has a definitive answer. */
+    public int recheckManualReviews() {
+        return reviewService.recheckWithProvider();
     }
 
     private PageRequest page() {

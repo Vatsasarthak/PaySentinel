@@ -22,7 +22,7 @@ class OutboxApplicationTests extends BaseIntegrationTest {
 	void contextLoadsAndAppliesAllMigrations() {
 		Integer applied = jdbcTemplate.queryForObject(
 				"select count(*) from flyway_schema_history where success", Integer.class);
-		assertThat(applied).isEqualTo(4);
+		assertThat(applied).isEqualTo(5);
 	}
 
 	@Test

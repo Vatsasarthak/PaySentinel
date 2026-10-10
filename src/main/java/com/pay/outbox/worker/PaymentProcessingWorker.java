@@ -12,8 +12,10 @@ import com.pay.outbox.exception.PaymentOutcomeUnknownException;
 import com.pay.outbox.metrics.PayoutMetrics;
 import com.pay.outbox.queue.PayoutQueue;
 import com.pay.outbox.repository.PayoutRepository;
+import com.pay.outbox.service.AuditService;
 import com.pay.outbox.service.LedgerService;
 import com.pay.outbox.service.PaymentGatewayService;
+import com.pay.outbox.service.PaymentGatewayService.ProviderCheck;
 import com.pay.outbox.service.gateway.ProviderResponse;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -52,12 +54,14 @@ public class PaymentProcessingWorker {
     static final String RETRIES_EXHAUSTED = "RETRIES_EXHAUSTED";
     static final String MAX_DELIVERY_ATTEMPTS = "MAX_DELIVERY_ATTEMPTS";
     static final String DECLINED = "DECLINED";
+    public static final String OUTCOME_UNKNOWN = "PROVIDER_OUTCOME_UNKNOWN";
     private static final Set<String> DEAD_LETTER_REASONS = Set.of(RETRIES_EXHAUSTED, MAX_DELIVERY_ATTEMPTS);
 
     private final PayoutQueue queue;
     private final PayoutRepository payoutRepository;
     private final PaymentGatewayService paymentGatewayService;
     private final LedgerService ledgerService;
+    private final AuditService auditService;
     private final PayoutMetrics payoutMetrics;
     private final ObjectMapper objectMapper;
     private final PayoutProperties properties;
@@ -68,7 +72,7 @@ public class PaymentProcessingWorker {
 
     public PaymentProcessingWorker(PayoutQueue queue, PayoutRepository payoutRepository,
                                    PaymentGatewayService paymentGatewayService, LedgerService ledgerService,
-                                   PayoutMetrics payoutMetrics, ObjectMapper objectMapper,
+                                   AuditService auditService, PayoutMetrics payoutMetrics, ObjectMapper objectMapper,
                                    PayoutProperties properties, Clock clock,
                                    @Qualifier("paymentWorkerExecutor") ThreadPoolTaskExecutor executor,
                                    TransactionTemplate transactionTemplate) {
@@ -76,6 +80,7 @@ public class PaymentProcessingWorker {
         this.payoutRepository = payoutRepository;
         this.paymentGatewayService = paymentGatewayService;
         this.ledgerService = ledgerService;
+        this.auditService = auditService;
         this.payoutMetrics = payoutMetrics;
         this.objectMapper = objectMapper;
         this.properties = properties;
@@ -184,9 +189,15 @@ public class PaymentProcessingWorker {
             reason = RETRIES_EXHAUSTED;
             deadLetter = true;
         } catch (PaymentOutcomeUnknownException e) {
-            // Leave the payout leased and the message unacknowledged: after the lease and visibility
-            // timeout it is redelivered and resolved from the provider's final answer.
-            log.warn("Outcome of payout {} is not known yet; it will be retried after the lease expires", payoutId);
+            if (attempt < worker.getMaxDeliveryAttempts()) {
+                // Leave the payout leased and the message unacknowledged: after the lease and visibility
+                // timeout it is redelivered and resolved from the provider's final answer.
+                log.warn("Outcome of payout {} is not known yet; it will be retried after the lease expires",
+                        payoutId);
+                return;
+            }
+            // Out of attempts and still unknown: never refund a payment that may complete.
+            parkForReview(rawMessage, payoutId, attempt);
             return;
         }
 
@@ -230,22 +241,37 @@ public class PaymentProcessingWorker {
         }));
     }
 
-    private void handleUnclaimable(String rawMessage, UUID payoutId, Instant now) {
-        boolean exhausted = Boolean.TRUE.equals(transactionTemplate.execute(status -> {
-            if (payoutRepository.exhaustDeliveries(payoutId, MAX_DELIVERY_ATTEMPTS, now,
-                    properties.getWorker().getMaxDeliveryAttempts()) == 0) {
+    private void parkForReview(String rawMessage, UUID payoutId, int attempt) {
+        Boolean parked = transactionTemplate.execute(status -> {
+            if (payoutRepository.markForReview(payoutId, attempt, OUTCOME_UNKNOWN, clock.instant()) == 0) {
                 return false;
             }
-            requireLedger(ledgerService.release(payoutId) == LedgerService.ReleaseResult.RELEASED,
-                    "release", payoutId);
+            auditService.record("system", "PAYOUT_MANUAL_REVIEW_OPENED", "PAYOUT", payoutId.toString(),
+                    AuditService.details("reason", OUTCOME_UNKNOWN, "attempt", attempt));
             return true;
-        }));
-        if (exhausted) {
-            log.error("Payout {} exceeded {} delivery attempts; failed, refunded and dead-lettered", payoutId,
-                    properties.getWorker().getMaxDeliveryAttempts());
-            payoutMetrics.incrementFailed();
-            payoutMetrics.incrementRefunded();
-            deadLetter(rawMessage, payoutId.toString());
+        });
+        if (Boolean.TRUE.equals(parked)) {
+            log.error("Payout {} moved to MANUAL_REVIEW after {} attempts: provider outcome unknown; funds stay held",
+                    payoutId, attempt);
+            payoutMetrics.incrementManualReview();
+        }
+        queue.ack(rawMessage);
+    }
+
+    /**
+     * Called when a payout could not be claimed. If its delivery budget is spent, ask the provider before
+     * giving up: a completed payment is settled, a declined or never-executed one is refunded, and an
+     * unknown outcome goes to manual review with the funds still held.
+     */
+    private void handleUnclaimable(String rawMessage, UUID payoutId, Instant now) {
+        Payout candidate = payoutRepository.findById(payoutId).orElse(null);
+        int maxAttempts = properties.getWorker().getMaxDeliveryAttempts();
+        boolean budgetSpent = candidate != null && candidate.getFundsStatus() == FundsStatus.HELD
+                && candidate.getAttempts() >= maxAttempts
+                && (candidate.getStatus() == PayoutStatus.PENDING
+                || (candidate.getStatus() == PayoutStatus.PROCESSING && candidate.getLeaseUntil() != null
+                && candidate.getLeaseUntil().isBefore(now)));
+        if (budgetSpent && resolveExhausted(rawMessage, payoutId, now, maxAttempts)) {
             return;
         }
 
@@ -261,6 +287,76 @@ public class PaymentProcessingWorker {
                 current != null ? current.getStatus() : null);
         payoutMetrics.incrementDuplicateSkipped();
         queue.ack(rawMessage);
+    }
+
+    private boolean resolveExhausted(String rawMessage, UUID payoutId, Instant now, int maxAttempts) {
+        ProviderCheck check = paymentGatewayService.checkProvider(payoutId);
+        PayoutStatus to;
+        FundsStatus funds;
+        String reason;
+        switch (check.state()) {
+            case COMPLETED -> {
+                to = PayoutStatus.COMPLETED;
+                funds = FundsStatus.SETTLED;
+                reason = null;
+            }
+            case FAILED -> {
+                to = PayoutStatus.FAILED;
+                funds = FundsStatus.RELEASED;
+                reason = DECLINED;
+            }
+            case NOT_FOUND -> {
+                to = PayoutStatus.FAILED;
+                funds = FundsStatus.RELEASED;
+                reason = MAX_DELIVERY_ATTEMPTS;
+            }
+            default -> {
+                to = PayoutStatus.MANUAL_REVIEW;
+                funds = FundsStatus.HELD;
+                reason = OUTCOME_UNKNOWN;
+            }
+        }
+        boolean resolved = Boolean.TRUE.equals(transactionTemplate.execute(status -> {
+            if (payoutRepository.resolveExhausted(payoutId, to, funds, reason, check.providerReference(), now,
+                    maxAttempts) == 0) {
+                return false;
+            }
+            switch (to) {
+                case COMPLETED -> requireLedger(ledgerService.settle(payoutId) == LedgerService.SettleResult.SETTLED,
+                        "settle", payoutId);
+                case FAILED -> requireLedger(ledgerService.release(payoutId) == LedgerService.ReleaseResult.RELEASED,
+                        "release", payoutId);
+                default -> auditService.record("system", "PAYOUT_MANUAL_REVIEW_OPENED", "PAYOUT",
+                        payoutId.toString(), AuditService.details("reason", OUTCOME_UNKNOWN,
+                                "providerState", check.state().name(), "deliveryAttempts", maxAttempts));
+            }
+            return true;
+        }));
+        if (!resolved) {
+            return false;
+        }
+        switch (to) {
+            case COMPLETED -> {
+                log.warn("Payout {} exceeded {} delivery attempts but the provider reports it paid; completed",
+                        payoutId, maxAttempts);
+                payoutMetrics.incrementCompleted();
+                queue.ack(rawMessage);
+            }
+            case FAILED -> {
+                log.error("Payout {} exceeded {} delivery attempts; provider state {}; failed, refunded and "
+                        + "dead-lettered", payoutId, maxAttempts, check.state());
+                payoutMetrics.incrementFailed();
+                payoutMetrics.incrementRefunded();
+                deadLetter(rawMessage, payoutId.toString());
+            }
+            default -> {
+                log.error("Payout {} exceeded {} delivery attempts with an unknown provider outcome ({}); "
+                        + "moved to MANUAL_REVIEW, funds stay held", payoutId, maxAttempts, check.state());
+                payoutMetrics.incrementManualReview();
+                queue.ack(rawMessage);
+            }
+        }
+        return true;
     }
 
     /** A payout in this state must have exactly one open hold; anything else rolls the transaction back. */

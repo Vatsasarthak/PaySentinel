@@ -212,6 +212,32 @@ class LedgerServiceIntegrationTest extends BaseIntegrationTest {
     }
 
     @Test
+    void concurrentFundingAndHoldsOnOneAccountStayConsistent() throws Exception {
+        ledgerService.seedBalance(LEDGER_ACCOUNT, 0L);
+        List<UUID> payouts = new ArrayList<>();
+        for (int i = 0; i < 20; i++) {
+            payouts.add(payoutRow(100L));
+        }
+        List<Callable<Object>> work = new ArrayList<>();
+        for (int i = 0; i < 20; i++) {
+            String key = "test-credit-" + i;
+            work.add(() -> tx.execute(s -> ledgerService.credit(LEDGER_ACCOUNT, 100L, key, false)));
+            UUID payoutId = payouts.get(i);
+            work.add(() -> hold(payoutId, 100L));
+        }
+
+        List<Object> results = runConcurrently(work);
+
+        long held = results.stream().filter(r -> r == HoldResult.HELD).count();
+        assertThat(account().held()).isEqualTo(held * 100L);
+        assertThat(account().available()).isEqualTo(2_000L - held * 100L);
+        assertThat(reconciliationService.reconcile().consistent()).isTrue();
+        // A repeated credit with the same key does not credit again.
+        tx.execute(s -> ledgerService.credit(LEDGER_ACCOUNT, 100L, "test-credit-0", false));
+        assertThat(account().available()).isEqualTo(2_000L - held * 100L);
+    }
+
+    @Test
     void reconciliationDetectsTampering() {
         hold(payoutRow(30_000L), 30_000L);
         assertThat(reconciliationService.reconcile().consistent()).isTrue();

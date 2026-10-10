@@ -43,6 +43,12 @@ import java.util.regex.Pattern;
  * Nothing is discarded: imported balance keys are renamed to {@code ledger-migrated:<accountId>} and
  * hold markers are left in place. The import runs before the HTTP server and scheduled jobs start.
  * Old (pre-V4) instances must be stopped first: they would keep writing balances to Redis.
+ * <p>
+ * Each account is imported in one transaction, so an interrupted import leaves either the whole
+ * account imported or nothing; a restart resumes with the remaining accounts. If legacy data remains
+ * unimported afterwards (a conflict with an existing PostgreSQL account, or the import disabled), the
+ * application refuses to start by default: payouts whose funds were held in Redis cannot be settled or
+ * refunded safely until an operator reconciles them.
  */
 @Slf4j
 @Component
@@ -62,6 +68,12 @@ public class RedisLedgerImporter implements SmartInitializingSingleton {
 
     private enum Outcome { IMPORTED, ALREADY_IMPORTED, CONFLICT }
 
+    /** Accounts of payouts whose funds were held by the Redis ledger and have no PostgreSQL ledger entry yet. */
+    private static final String LEGACY_ACCOUNTS_SQL = """
+            SELECT DISTINCT p.recipient_id FROM payouts p
+             WHERE (p.status = 'RESERVING' OR p.funds_status IN ('HELD', 'LEGACY_HELD', 'RELEASE_PENDING', 'SETTLE_PENDING'))
+               AND NOT EXISTS (SELECT 1 FROM ledger_entries e WHERE e.payout_id = p.id)""";
+
     private final RedisTemplate<String, String> redisTemplate;
     private final JdbcTemplate jdbc;
     private final LedgerService ledgerService;
@@ -72,23 +84,46 @@ public class RedisLedgerImporter implements SmartInitializingSingleton {
 
     @Override
     public void afterSingletonsInstantiated() {
-        if (!properties.getLedger().isRedisImportEnabled()) {
+        if (properties.getLedger().isRedisImportEnabled()) {
+            ImportReport report = importLegacyLedger();
+            if (!report.imported().isEmpty() || !report.conflicts().isEmpty()) {
+                log.warn("Legacy Redis ledger import: imported={}, conflicts={}", report.imported(),
+                        report.conflicts());
+            }
+        } else {
             log.info("Legacy Redis ledger import is disabled");
+        }
+        verifyNoUnmigratedLegacyData();
+    }
+
+    /**
+     * Fails (or, if configured, only logs) when legacy ledger data is still waiting to be imported.
+     */
+    public void verifyNoUnmigratedLegacyData() {
+        Set<String> unmigrated = unmigratedAccounts();
+        if (unmigrated.isEmpty()) {
             return;
         }
-        ImportReport report = importLegacyLedger();
-        if (!report.imported().isEmpty() || !report.conflicts().isEmpty()) {
-            log.warn("Legacy Redis ledger import: imported={}, conflicts={}", report.imported(), report.conflicts());
+        String message = "Legacy Redis ledger data has not been imported for accounts " + unmigrated
+                + ". Resolve the conflicts (or enable payout.ledger.redis-import-enabled) before processing payouts;"
+                + " set payout.ledger.fail-on-unmigrated-legacy-data=false only to start for investigation.";
+        if (properties.getLedger().isFailOnUnmigratedLegacyData()) {
+            throw new IllegalStateException(message);
         }
+        log.error(message);
+    }
+
+    /** Accounts with a remaining legacy Redis balance key or legacy-held payouts without ledger entries. */
+    public Set<String> unmigratedAccounts() {
+        Set<String> accounts = new TreeSet<>(legacyBalances().keySet());
+        accounts.addAll(jdbc.queryForList(LEGACY_ACCOUNTS_SQL, String.class));
+        return accounts;
     }
 
     public ImportReport importLegacyLedger() {
         Map<String, Long> balances = legacyBalances();
         Set<String> accounts = new TreeSet<>(balances.keySet());
-        accounts.addAll(jdbc.queryForList("""
-                SELECT DISTINCT p.recipient_id FROM payouts p
-                 WHERE (p.status = 'RESERVING' OR p.funds_status IN ('HELD', 'LEGACY_HELD', 'RELEASE_PENDING', 'SETTLE_PENDING'))
-                   AND NOT EXISTS (SELECT 1 FROM ledger_entries e WHERE e.payout_id = p.id)""", String.class));
+        accounts.addAll(jdbc.queryForList(LEGACY_ACCOUNTS_SQL, String.class));
 
         ImportReport report = new ImportReport(new ArrayList<>(), new ArrayList<>(), new ArrayList<>());
         for (String account : accounts) {
@@ -149,7 +184,14 @@ public class RedisLedgerImporter implements SmartInitializingSingleton {
             return true;
         });
         if (!Boolean.TRUE.equals(imported)) {
-            return Outcome.ALREADY_IMPORTED;
+            // The account appeared while importing: imported by another instance, or created natively.
+            if (ledgerService.entryExists(migrationKey)) {
+                markMigrated(accountId);
+                return Outcome.ALREADY_IMPORTED;
+            }
+            log.error("Account {} was created in PostgreSQL while its legacy Redis data was being imported; "
+                    + "reconcile it manually", accountId);
+            return Outcome.CONFLICT;
         }
         markMigrated(accountId);
         payoutMetrics.incrementLedgerImport();

@@ -13,8 +13,8 @@ import org.springframework.web.filter.OncePerRequestFilter;
 import java.io.IOException;
 
 /**
- * Applies per-client rate limits after authentication: payout creation, payout reads and
- * administrative endpoints each have their own bucket per API client.
+ * Applies per-key rate limits after authentication: payout creation, payout reads, and
+ * administrative/treasury endpoints each have their own bucket per API key.
  */
 public class RateLimitFilter extends OncePerRequestFilter {
 
@@ -60,7 +60,7 @@ public class RateLimitFilter extends OncePerRequestFilter {
 
     static String classify(HttpServletRequest request) {
         String path = request.getRequestURI().substring(request.getContextPath().length());
-        if (path.startsWith(PAYOUTS + "/ledger") || path.equals(PAYOUTS + "/dlq")
+        if (path.startsWith(PAYOUTS + "/ledger") || path.equals(PAYOUTS + "/dlq") || path.startsWith("/api/v1/treasury")
                 || (path.startsWith("/actuator") && !path.startsWith("/actuator/health")
                 && !path.startsWith("/actuator/info"))) {
             return "admin";

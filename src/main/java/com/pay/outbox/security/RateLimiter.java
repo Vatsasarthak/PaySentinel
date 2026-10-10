@@ -38,14 +38,24 @@ public class RateLimiter {
         this.clock = clock;
         script.setScriptSource(new ResourceScriptSource(new ClassPathResource("lua/ratelimit/token_bucket.lua")));
         script.setResultType(List.class);
+        // Fail at startup, not on every request, if a policy is misconfigured.
+        PayoutProperties.RateLimit limits = properties.getRateLimit();
+        validate("create", limits.getCreate());
+        validate("read", limits.getRead());
+        validate("admin", limits.getAdmin());
+        validate("auth-failure", limits.getAuthFailure());
+    }
+
+    private static void validate(String name, PayoutProperties.Policy policy) {
+        if (policy == null || policy.getCapacity() < 1 || policy.getRefillPerSecond() <= 0) {
+            throw new IllegalStateException("payout.rate-limit." + name + " needs capacity >= 1 and refill-per-second > 0");
+        }
     }
 
     /** Consumes one token from the bucket {@code policyName:subject}. */
     public Decision tryAcquire(String policyName, String subject, PayoutProperties.Policy policy) {
-        if (policy.getCapacity() < 1 || policy.getRefillPerSecond() <= 0) {
-            throw new IllegalStateException("Rate-limit policy '" + policyName + "' needs capacity >= 1 and refill > 0");
-        }
         try {
+            validate(policyName, policy);
             List<?> result = evaluate("ratelimit:" + policyName + ":" + subject, policy);
             if (result == null || result.size() < 2) {
                 throw new IllegalStateException("Rate-limit script returned no result");

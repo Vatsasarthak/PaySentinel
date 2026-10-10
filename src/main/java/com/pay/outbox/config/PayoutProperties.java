@@ -15,8 +15,15 @@ import java.util.List;
 @ConfigurationProperties(prefix = "payout")
 public class PayoutProperties {
 
-    /** ISO 4217 codes accepted by the API. The Redis ledger is single-currency per account. */
+    /** ISO 4217 codes accepted by the API. The ledger is single-currency per account. */
     private List<String> supportedCurrencies = List.of("INR");
+
+    /**
+     * Deployment environment (APP_ENVIRONMENT). Development-only features require it to be explicitly
+     * {@code local}; {@code production} refuses every unsafe setting. Unset by default, so nothing is
+     * treated as a developer machine unless declared (see ProductionSafetyCheck).
+     */
+    private String environment = "";
 
     private final Relay relay = new Relay();
     private final Worker worker = new Worker();
@@ -26,6 +33,7 @@ public class PayoutProperties {
     private final Ledger ledger = new Ledger();
     private final Security security = new Security();
     private final RateLimit rateLimit = new RateLimit();
+    private final Funding funding = new Funding();
 
     @Data
     public static class Relay {
@@ -80,6 +88,20 @@ public class PayoutProperties {
          * Redis keys are renamed to ledger-migrated:*, never deleted).
          */
         private boolean redisImportEnabled = true;
+        /**
+         * Refuse to start while legacy Redis ledger data remains unimported (import conflicts, or the
+         * import disabled with legacy data present): such payouts could not be processed safely.
+         */
+        private boolean failOnUnmigratedLegacyData = true;
+    }
+
+    @Data
+    public static class Funding {
+        /**
+         * Dual control: an adjustment is posted only after a second, different treasury key approves it.
+         * When false, adjustments post immediately (single-operator development setups only).
+         */
+        private boolean requireApproval = true;
     }
 
     @Data
@@ -87,6 +109,19 @@ public class PayoutProperties {
         /** API clients and the ledger accounts each one may use. */
         private List<Client> clients = new ArrayList<>();
         private Admin admin = new Admin();
+        /** Treasury keys: funding adjustments and manual-review resolutions. None by default. */
+        private List<Treasurer> treasury = new ArrayList<>();
+    }
+
+    @Data
+    public static class Treasurer {
+        private String name;
+        private String apiKey;
+        private String apiKeySha256;
+        /** Accounts this key may fund or debit and whose payout reviews it may resolve. */
+        private List<String> accounts = new ArrayList<>();
+        /** Explicit opt-in to act on every account. */
+        private boolean allAccounts = false;
     }
 
     @Data

@@ -7,6 +7,11 @@ public enum PayoutStatus {
     PENDING,
     /** Claimed by a worker holding a lease. */
     PROCESSING,
+    /**
+     * The provider outcome could not be established. Funds stay held; the payout is neither completed
+     * nor refunded until the provider reports a final result or a treasury operator resolves it.
+     */
+    MANUAL_REVIEW,
     COMPLETED,
     FAILED,
     /** Reservation abandoned before the payout was accepted; any hold is released. */

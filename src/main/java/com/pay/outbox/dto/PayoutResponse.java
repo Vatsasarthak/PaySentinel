@@ -14,6 +14,7 @@ public class PayoutResponse {
 
     private UUID id;
     private String recipientId;
+    /** Whole minor units (paise for INR). */
     private Long amount;
     private String currency;
     private PayoutStatus status;

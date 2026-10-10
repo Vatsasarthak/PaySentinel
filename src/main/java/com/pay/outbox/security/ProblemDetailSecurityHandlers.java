@@ -1,6 +1,7 @@
 package com.pay.outbox.security;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.pay.outbox.exception.ProblemTypes;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.http.HttpHeaders;
@@ -19,8 +20,6 @@ import java.net.URI;
 /** Writes security and rate-limit errors as RFC 7807 problem details, matching the API's other errors. */
 @Component
 public class ProblemDetailSecurityHandlers implements AuthenticationEntryPoint, AccessDeniedHandler {
-
-    private static final String BASE_URL = "https://outbox-payments.com/errors";
 
     private final ObjectMapper objectMapper;
 
@@ -61,7 +60,7 @@ public class ProblemDetailSecurityHandlers implements AuthenticationEntryPoint, 
                        String title, String type, String detail) throws IOException {
         ProblemDetail problem = ProblemDetail.forStatusAndDetail(status, detail);
         problem.setTitle(title);
-        problem.setType(URI.create(BASE_URL + "/" + type));
+        problem.setType(ProblemTypes.of(type));
         problem.setInstance(URI.create(request.getRequestURI()));
         response.setStatus(status.value());
         response.setContentType(MediaType.APPLICATION_PROBLEM_JSON_VALUE);

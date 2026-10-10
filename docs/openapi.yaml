@@ -1,9 +1,10 @@
 openapi: 3.0.3
 info:
-  title: Outbox Payment System API
+  title: PaySentinel API
   version: 1.0.0
   description: |
-    Simulated payout processing built on the transactional outbox pattern. No real money moves.
+    PaySentinel: Reliable Payout Processing & Ledger Reconciliation. Simulated payout processing built
+    on the transactional outbox pattern; the payment provider is a simulator and no real money moves.
 
     Authenticate every request (except `/actuator/health` and `/actuator/info`) with an API key
     in the `X-API-Key` header. A CLIENT key may create and read payouts only for the ledger accounts
@@ -11,10 +12,21 @@ info:
     non-public actuator endpoints; it may create or read payouts only for accounts explicitly granted
     to it (or read all payouts when `payout.security.admin.read-all-payouts=true`).
 
+    TREASURY keys (none by default) request, approve and reject funding adjustments and resolve payouts
+    in manual review, for their granted accounts. Adjustments require approval by a second, different
+    treasury key. ADMIN keys cannot move money.
+
     Requests are rate limited per API key (and invalid keys per client IP); limited requests get 429
     with a `Retry-After` header.
 
-    Errors are returned as RFC 7807 problem details (`application/problem+json`).
+    Errors are returned as RFC 7807 problem details (`application/problem+json`). The application's
+    own errors have a `type` URN of the form `urn:paysentinel:errors:<slug>`; errors produced by the
+    framework itself (for example an unknown route) use `about:blank`.
+
+    Amounts: every amount and balance is a whole number of the currency's minor unit, paise for INR
+    (5000 = INR 50.00). This is a convention of this application; the payment provider is simulated and
+    nothing is settled with a real payment network. Fractional JSON numbers (50.75, 0.99, 5000.0, 5e3)
+    are rejected with 400 rather than truncated.
 servers:
   - url: http://localhost:8080
 security:
@@ -96,6 +108,7 @@ paths:
         - name: amount
           in: query
           required: true
+          description: New available balance in whole paise (100000 = INR 1,000.00).
           schema: { type: integer, format: int64, minimum: 0, maximum: 1000000000000 }
       responses:
         '200':
@@ -118,7 +131,7 @@ paths:
           schema: { type: string, pattern: '^[A-Za-z0-9_-]{1,64}$' }
       responses:
         '200':
-          description: Current balance
+          description: Current available balance in whole paise
           content:
             application/json:
               schema: { type: integer, format: int64 }
@@ -156,6 +169,116 @@ paths:
               schema: { $ref: '#/components/schemas/ReconciliationReport' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+  /api/v1/payouts/ledger/audit/{targetType}/{targetId}:
+    get:
+      summary: Audit trail of an account, adjustment or payout (ADMIN)
+      operationId: audit
+      parameters:
+        - { name: targetType, in: path, required: true, schema: { type: string, enum: [ACCOUNT, ADJUSTMENT, PAYOUT] } }
+        - { name: targetId, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Audit events, oldest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/AuditEvent' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /api/v1/treasury/adjustments:
+    post:
+      summary: Request a funding adjustment (TREASURY)
+      description: >-
+        Creates a CREDIT or DEBIT request in PENDING_APPROVAL. It is posted to the ledger only when a
+        different treasury key approves it. Idempotency keys are scoped to the requesting key; an
+        identical retry returns the original (200), a different payload with the same key returns 409.
+      operationId: requestAdjustment
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AdjustmentRequest' }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/Adjustment' } } } }
+        '200': { description: Identical retry, content: { application/json: { schema: { $ref: '#/components/schemas/Adjustment' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /api/v1/treasury/adjustments/{id}:
+    get:
+      summary: Read an adjustment (TREASURY)
+      operationId: getAdjustment
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200': { description: The adjustment, content: { application/json: { schema: { $ref: '#/components/schemas/Adjustment' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/treasury/adjustments/{id}/approve:
+    post:
+      summary: Approve and post an adjustment (a different TREASURY key)
+      operationId: approveAdjustment
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Decision' }
+      responses:
+        '200': { description: Posted, content: { application/json: { schema: { $ref: '#/components/schemas/Adjustment' } } } }
+        '403': { description: 'Requester cannot approve their own adjustment (four-eyes-required), or role not allowed' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Already posted or rejected (state-conflict) }
+        '422': { description: A debit would exceed the available balance; the adjustment stays pending }
+  /api/v1/treasury/adjustments/{id}/reject:
+    post:
+      summary: Reject an adjustment (TREASURY)
+      operationId: rejectAdjustment
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Decision' }
+      responses:
+        '200': { description: Rejected, content: { application/json: { schema: { $ref: '#/components/schemas/Adjustment' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Already posted or rejected (state-conflict) }
+  /api/v1/treasury/payout-reviews:
+    get:
+      summary: Payouts in manual review on the key's accounts (TREASURY)
+      operationId: openReviews
+      responses:
+        '200':
+          description: Payouts whose provider outcome is unknown; their funds are held
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Review' }
+  /api/v1/treasury/payout-reviews/{id}/resolution:
+    post:
+      summary: Resolve a payout in manual review (TREASURY)
+      description: >-
+        COMPLETED settles the held funds and requires the provider payment reference; FAILED refunds them.
+        Refused with 409 when it contradicts a definitive provider answer, or when the payout is not in review.
+      operationId: resolveReview
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReviewResolution' }
+      responses:
+        '200': { description: Resolved, content: { application/json: { schema: { $ref: '#/components/schemas/Review' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Not in review, already resolved, or contradicts the provider (state-conflict) }
   /api/v1/payouts/dlq:
     get:
       summary: List dead-lettered queue messages (ADMIN)
@@ -197,7 +320,9 @@ components:
           format: int64
           minimum: 1
           maximum: 1000000000000
-          description: Integer amount in the account's currency units.
+          description: >-
+            Whole number of the currency's minor unit, paise for INR (5000 = INR 50.00). Fractional
+            numbers are rejected with 400.
         currency:
           type: string
           pattern: '^[A-Z]{3}$'
@@ -210,12 +335,14 @@ components:
       properties:
         id: { type: string, format: uuid }
         recipientId: { type: string }
-        amount: { type: integer, format: int64 }
+        amount: { type: integer, format: int64, description: Whole paise (minor units) }
         currency: { type: string }
         status:
           type: string
-          enum: [PENDING, PROCESSING, COMPLETED, FAILED, REJECTED, CANCELLED, RESERVING]
-          description: CANCELLED and RESERVING only appear on payouts created before migration V4.
+          enum: [PENDING, PROCESSING, MANUAL_REVIEW, COMPLETED, FAILED, REJECTED, CANCELLED, RESERVING]
+          description: >-
+            MANUAL_REVIEW means the provider outcome is unknown and the funds are still held.
+            CANCELLED and RESERVING only appear on payouts created before migration V4.
         fundsStatus:
           type: string
           enum: [NONE, HELD, SETTLED, RELEASED, RELEASE_PENDING, SETTLE_PENDING, LEGACY_HELD]
@@ -243,12 +370,84 @@ components:
         createdAt: '2026-07-04T04:30:00.123456Z'
         updatedAt: '2026-07-04T04:30:00.131002Z'
         attempts: 0
+    AdjustmentRequest:
+      type: object
+      required: [accountId, direction, amount, currency, reasonCode, note, idempotencyKey]
+      properties:
+        accountId: { type: string, pattern: '^[A-Za-z0-9_-]{1,64}$' }
+        direction: { type: string, enum: [CREDIT, DEBIT] }
+        amount:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 1000000000000
+          description: Whole paise (minor units); fractional numbers are rejected with 400.
+        currency: { type: string, pattern: '^[A-Z]{3}$' }
+        reasonCode: { type: string, enum: [INITIAL_FUNDING, TOP_UP, WITHDRAWAL, CORRECTION, CHARGEBACK, OTHER] }
+        note: { type: string, maxLength: 500 }
+        externalReference: { type: string, maxLength: 128 }
+        idempotencyKey: { type: string, pattern: '^[A-Za-z0-9._:-]{8,128}$' }
+    Adjustment:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        requestedBy: { type: string }
+        idempotencyKey: { type: string }
+        accountId: { type: string }
+        direction: { type: string, enum: [CREDIT, DEBIT] }
+        amount: { type: integer, format: int64 }
+        currency: { type: string }
+        reasonCode: { type: string }
+        note: { type: string }
+        externalReference: { type: string, nullable: true }
+        approvalRequired: { type: boolean }
+        status: { type: string, enum: [PENDING_APPROVAL, POSTED, REJECTED] }
+        decidedBy: { type: string, nullable: true }
+        decidedAt: { type: string, format: date-time, nullable: true }
+        decisionNote: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
+    Decision:
+      type: object
+      required: [note]
+      properties:
+        note: { type: string, maxLength: 500 }
+    ReviewResolution:
+      type: object
+      required: [resolution, note]
+      properties:
+        resolution: { type: string, enum: [COMPLETED, FAILED] }
+        providerReference: { type: string, maxLength: 100, description: Required for COMPLETED }
+        note: { type: string, maxLength: 500 }
+    Review:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        recipientId: { type: string }
+        amount: { type: integer, format: int64 }
+        currency: { type: string }
+        status: { type: string }
+        fundsStatus: { type: string }
+        reason: { type: string, nullable: true }
+        providerReference: { type: string, nullable: true }
+        attempts: { type: integer }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+    AuditEvent:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        occurredAt: { type: string, format: date-time }
+        actor: { type: string }
+        action: { type: string }
+        targetType: { type: string }
+        targetId: { type: string }
+        details: { type: string, description: JSON document }
     LedgerAccount:
       type: object
       properties:
         accountId: { type: string }
-        availableBalance: { type: integer, format: int64 }
-        heldBalance: { type: integer, format: int64 }
+        availableBalance: { type: integer, format: int64, description: Whole paise (minor units) }
+        heldBalance: { type: integer, format: int64, description: Whole paise (minor units) }
         recentEntries:
           type: array
           items:
@@ -257,7 +456,7 @@ components:
               id: { type: integer, format: int64 }
               accountId: { type: string }
               payoutId: { type: string, format: uuid, nullable: true }
-              entryType: { type: string, enum: [OPENING_BALANCE, ADJUSTMENT, HOLD, RELEASE, SETTLE] }
+              entryType: { type: string, enum: [OPENING_BALANCE, ADJUSTMENT, HOLD, RELEASE, SETTLE, CREDIT, DEBIT] }
               availableDelta: { type: integer, format: int64 }
               heldDelta: { type: integer, format: int64 }
               availableAfter: { type: integer, format: int64 }
@@ -275,7 +474,11 @@ components:
     Problem:
       type: object
       properties:
-        type: { type: string, format: uri }
+        type:
+          type: string
+          format: uri
+          description: '`urn:paysentinel:errors:<slug>` for application errors; `about:blank` for framework errors.'
+          example: urn:paysentinel:errors:validation-failed
         title: { type: string }
         status: { type: integer }
         detail: { type: string }
@@ -286,12 +489,12 @@ components:
           description: Field-level messages (validation failures only).
   responses:
     BadRequest:
-      description: Invalid input (validation failure, malformed JSON, malformed UUID or parameter)
+      description: Invalid input (validation failure, malformed JSON including a fractional amount, malformed UUID or parameter)
       content:
         application/problem+json:
           schema: { $ref: '#/components/schemas/Problem' }
           example:
-            type: https://outbox-payments.com/errors/validation-failed
+            type: urn:paysentinel:errors:validation-failed
             title: Validation Failed
             status: 400
             detail: One or more fields are invalid

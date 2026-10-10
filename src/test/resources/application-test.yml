@@ -8,6 +8,8 @@ spring:
     locations: classpath:db/migration
 
 payout:
+  # The test profile enables seeding, which is only permitted in a declared development environment.
+  environment: test
   scheduling:
     # Tests drive the relay, worker and recovery jobs explicitly to keep assertions deterministic.
     enabled: false
@@ -33,6 +35,15 @@ payout:
       api-key: test-admin-api-key-0123456789abcdef
       accounts: []
       read-all-payouts: false
+    treasury:
+      - name: treasury-a
+        api-key: test-treasury-a-key-0123456789abcdef
+        accounts: [test_user, shared_account, new_merchant]
+      - name: treasury-b
+        api-key: test-treasury-b-key-0123456789abcdef
+        accounts: [test_user, shared_account, new_merchant]
+  funding:
+    require-approval: true
   rate-limit:
     # Generous defaults so ordinary tests are never throttled; RateLimitIntegrationTest tightens them.
     create: { capacity: 10000, refill-per-second: 10000 }
