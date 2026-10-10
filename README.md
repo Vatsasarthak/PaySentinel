@@ -2,14 +2,20 @@
 
 **Reliable Payout Processing & Ledger Reconciliation**
 
-A Spring Boot service that simulates payout processing with the **transactional outbox pattern**.
-PostgreSQL is the source of truth for payouts, outbox events and the **ledger** (balances and an
-append-only journal). Redis carries the work queue, rate limits and scheduler locks. Background jobs
-relay events, process payments through a simulated payment provider, and repair anything left
-unfinished by crashes.
+A Spring Boot payout service that keeps money movement correct when messages are duplicated,
+workers crash and the payment provider times out. Built on the transactional outbox pattern, an
+append-only PostgreSQL ledger with automated reconciliation, and idempotency at every step.
 
-> **Simulation only.** The payment provider is a simulator. No real money moves and no external
-> financial service is called.
+> **Simulated provider.** Payments go to a built-in simulator. No real money moves and no bank or
+> payment network is called.
+
+- Payout, ledger hold and outbox event commit in one PostgreSQL transaction.
+- At-least-once Redis queue with leases, fencing tokens and crash recovery.
+- Unknown provider outcomes go to manual review with funds held; they are never refunded automatically.
+- Dual-approval treasury adjustments and an append-only audit log.
+- 146 automated tests against real PostgreSQL and Redis (Testcontainers); GitHub Actions CI workflow.
+
+Java 21 · Spring Boot 3.5 · PostgreSQL 16 · Redis 7 · Flyway · Docker
 
 ## Contents
 
@@ -436,7 +442,7 @@ Application settings (`application.yaml`, prefix `payout.`):
 | `rate-limit.enabled` / `fail-open` | `true` / `true` | Rate limiting; behaviour when Redis is unreachable (`false` → 503) |
 | `rate-limit.create` | 50 burst, 20/s | `POST /api/v1/payouts` per client |
 | `rate-limit.read` | 200 burst, 100/s | Payout reads per client |
-| `rate-limit.admin` | 30 burst, 10/s | Ledger/DLQ/protected actuator per key |
+| `rate-limit.admin` | 30 burst, 10/s | Ledger/DLQ/treasury/protected actuator per key |
 | `rate-limit.auth-failure` | 20 burst, 1/s | Invalid API keys per client IP |
 | `relay.interval-ms` / `batch-size` / `lock-at-most-for` | `1000` / `100` / `PT1M` | Outbox relay |
 | `worker.poll-interval-ms` / `concurrency` / `batch-size` | `200` / `16` / `20` | Queue consumer |
@@ -457,7 +463,7 @@ specification is in [`docs/openapi.yaml`](docs/openapi.yaml).
 | Method | Path | Who | Description |
 | --- | --- | --- | --- |
 | `POST` | `/api/v1/payouts` | Key granted the `recipientId` account | Initiate a payout. `202 Accepted` |
-| `GET` | `/api/v1/payouts/{id}` | Key granted the payout's account (ADMIN only with read-all) | Fetch a payout |
+| `GET` | `/api/v1/payouts/{id}` | Key granted the payout's account (ADMIN: accounts in `APP_ADMIN_ACCOUNTS`, or all with read-all) | Fetch a payout |
 | `POST` | `/api/v1/payouts/ledger/seed?accountId=&amount=` | ADMIN, `dev` only | Set an account's available balance |
 | `GET` | `/api/v1/payouts/ledger/balance/{accountId}` | ADMIN | Available balance |
 | `GET` | `/api/v1/payouts/ledger/accounts/{accountId}` | ADMIN | Available and held balance, last 50 ledger entries |
@@ -469,7 +475,7 @@ specification is in [`docs/openapi.yaml`](docs/openapi.yaml).
 | `POST` | `/api/v1/treasury/adjustments/{id}/approve` or `/reject` | A *different* TREASURY key | Post or reject; body `{"note": "..."}` |
 | `GET` | `/api/v1/treasury/payout-reviews` | TREASURY | Payouts in manual review on granted accounts |
 | `POST` | `/api/v1/treasury/payout-reviews/{id}/resolution` | TREASURY | `{"resolution":"COMPLETED","providerReference":"...","note":"..."}` or `FAILED` |
-| `GET` | `/actuator/health`, `/actuator/info` | public | Health (component details for ADMIN), build info |
+| `GET` | `/actuator/health`, `/actuator/info` | public | Health (component details for ADMIN); configured app name, description and version |
 | `GET` | `/actuator/metrics/**` | ADMIN | Metrics |
 
 ### Amounts
@@ -590,14 +596,41 @@ CI (`.github/workflows/ci.yml`) runs `./mvnw verify` and builds the Docker image
 The recovery job runs every 30 s on one instance at a time (ShedLock). Each run:
 1. Re-queues messages abandoned in `payout:processing`.
 2. Completes owed refunds.
-3. Re-publishes payouts that have been idle too long and whose message was lost.
+3. Re-asks the provider about payouts in `MANUAL_REVIEW`; only a definitive answer (completed or
+   failed) resolves them.
+4. Re-publishes payouts that have been idle too long and whose message was lost.
 
 Reconciliation runs every 5 minutes.
 
-A message is dead-lettered, and its payout `FAILED` and refunded, when:
-- the provider has no record of the payout after all retries (`RETRIES_EXHAUSTED`);
-- the payout has been claimed `max-delivery-attempts` times (`MAX_DELIVERY_ATTEMPTS`);
-- the message is malformed or references an unknown payout.
+How a delivery ends depends on what the provider reports. Each delivery makes up to
+`gateway.max-attempts` provider calls with the same idempotency key; after the last timeout the worker
+looks the key up:
+
+| Provider outcome | Payout | Funds | Queue message |
+| --- | --- | --- | --- |
+| Completed (answered directly, or found by the lookup) | `COMPLETED` | settled | acknowledged |
+| Declined (answered directly, or found by the lookup) | `FAILED` (`DECLINED`) | released | acknowledged |
+| Every call timed out and the provider never executed the request (not found) | `FAILED` (`RETRIES_EXHAUSTED`) | released | dead-lettered |
+| Unknown (still in flight or provider unreachable), delivery attempts left | unchanged | held | not acknowledged; redelivered after the lease and visibility timeout expire |
+| Unknown on the last delivery attempt | `MANUAL_REVIEW` (`PROVIDER_OUTCOME_UNKNOWN`) | held | acknowledged |
+
+A payout's delivery budget is `max-delivery-attempts` claims. When a message arrives for a payout
+whose budget is already spent, the worker asks the provider before deciding:
+
+| Provider reports | Payout | Funds | Queue message |
+| --- | --- | --- | --- |
+| Completed | `COMPLETED` | settled | acknowledged |
+| Declined | `FAILED` (`DECLINED`) | released | dead-lettered |
+| Never executed (not found) | `FAILED` (`MAX_DELIVERY_ATTEMPTS`) | released | dead-lettered |
+| Still in flight or unreachable | `MANUAL_REVIEW` (`PROVIDER_OUTCOME_UNKNOWN`) | held | acknowledged |
+
+A malformed message, or one that references an unknown payout, is dead-lettered without changing any
+payout. A message for a payout that is already final, or currently claimed by another worker, is a
+duplicate and is acknowledged without changing the payout; if a crash interrupted dead-lettering a
+failed payout, the duplicate completes it (dead-letter entries are de-duplicated by payout ID).
+Payouts in `MANUAL_REVIEW` keep their funds held until the recovery job gets a definitive provider
+answer or a treasury operator resolves them (see [Manual review](#manual-review-of-uncertain-payouts));
+they are never refunded automatically.
 
 ## Security
 
