@@ -14,7 +14,7 @@ RUN --mount=type=cache,target=/root/.m2 mvn -B -q -DskipTests package \
     && cp target/outbox-*.jar /workspace/app.jar
 
 # ---- Runtime stage -----------------------------------------------------------
-FROM eclipse-temurin:21-jre-alpine@sha256:51ab5e3302e7141ce665ca3ea85e8b5cd648eafbc3c0c90dd79d6537684e4555
+FROM eclipse-temurin:24-jre-alpine@sha256:4044b6c87cb088885bcd0220f7dc7a8a4aab76577605fa471945d2e98270741f
 
 RUN addgroup -S app && adduser -S -G app -u 10001 app
 WORKDIR /app
